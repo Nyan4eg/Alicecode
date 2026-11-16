@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self';">
+  <title>Alicecode</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="renderer.js"></script>
+</head>
+<body>
+  <aside class="sidebar" aria-label="Навигация">
+    <div class="brand"><span class="mark" aria-hidden="true"></span><strong>Alicecode</strong></div>
+    <button id="new-chat" class="primary new-chat" type="button" hidden>＋ Новый чат</button>
+    <div class="project-actions">
+      <button id="create-project" class="quiet" type="button"><span aria-hidden="true">＋</span> Создать проект</button>
+      <button id="open-project" class="quiet" type="button"><span aria-hidden="true">↗</span> Открыть папку</button>
+    </div>
+    <div class="side-label">Проекты</div>
+    <nav id="projects" aria-label="Проекты и чаты"></nav>
+    <button id="settings" class="quiet settings" type="button"><span aria-hidden="true">⚙</span> Настройки</button>
+  </aside>
+  <main class="workbench">
+    <header class="topbar">
+      <div class="heading">
+        <strong id="project-title">Рабочее пространство</strong>
+        <span id="chat-title"></span>
+      </div>
+      <div class="top-actions">
+        <span id="provider" class="provider"><i aria-hidden="true"></i> Alice AI LLM Flash</span>
+        <button id="toggle-inspector" class="quiet icon" type="button" title="Показать или скрыть файлы" aria-label="Панель файлов" aria-expanded="true">◫</button>
+      </div>
+    </header>
+    <div class="panes">
+      <section class="conversation" aria-label="Чат">
+        <div id="thread" class="thread">
+          <div id="empty" class="empty">
+            <span class="mark hero-mark" aria-hidden="true"></span>
+            <h1 id="empty-title">Начните с проекта</h1>
+            <p id="empty-note">Создайте папку или откройте существующий проект.</p>
+          </div>
+          <div id="messages" class="messages"></div>
+        </div>
+        <div id="composer-area" class="composer-area" hidden>
+          <div id="permission" class="permission" hidden>
+            <strong id="permission-title"></strong>
+            <pre id="permission-input"></pre>
+            <div class="permission-actions">
+              <button id="deny" class="quiet" type="button">Отклонить</button>
+              <button id="allow" class="primary" type="button">Разрешить один раз</button>
+            </div>
+          </div>
+          <form id="composer" class="composer">
+            <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" placeholder="Опишите задачу для Алисы…"></textarea>
+            <div class="composer-footer">
+              <span id="compose-hint">Enter — отправить · Shift + Enter — новая строка</span>
+              <button id="stop" class="quiet" type="button" hidden>■ Остановить</button>
+              <button id="send" class="primary" type="submit" disabled>Отправить <span aria-hidden="true">↑</span></button>
+            </div>
+          </form>
+          <div id="notice" class="notice" role="status" hidden></div>
+        </div>
+      </section>
+      <aside id="inspector" class="inspector" aria-label="Обозреватель проекта">
+        <div class="explorer-heading">
+          <strong>Рабочая папка</strong>
+          <button id="reveal" class="quiet icon" type="button" title="Открыть в Проводнике" aria-label="Открыть в Проводнике" disabled>↗</button>
+        </div>
+        <div class="tabs" role="tablist" aria-label="Содержимое рабочей папки">
+          <button id="files-tab" type="button" role="tab" aria-selected="true">Файлы</button>
+          <button id="changes-tab" type="button" role="tab" aria-selected="false">Изменения <span id="changes-count" hidden></span></button>
+        </div>
+        <div id="workspace" class="workspace"></div>
+      </aside>
+    </div>
+  </main>
+
+  <dialog id="project-dialog" aria-labelledby="project-dialog-title">
+    <form id="project-form">
+      <div class="dialog-header"><h2 id="project-dialog-title">Создать проект</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <label for="project-name">Имя проекта</label>
+      <input id="project-name" type="text" placeholder="Например, Калькулятор" required maxlength="80">
+      <div class="field-label">Расположение</div>
+      <div class="location"><span id="project-path"></span><button id="choose-path" class="quiet" type="button">Выбрать</button></div>
+      <p id="project-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="confirm-project" class="primary" type="submit">Создать</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <div class="dialog-header"><h2 id="settings-title">Yandex AI Studio</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="settings-status" class="muted"></p>
+      <label for="folder-id">ID каталога</label>
+      <input id="folder-id" type="text" spellcheck="false" autocomplete="off" required>
+      <label for="api-key">API-ключ</label>
+      <input id="api-key" type="password" autocomplete="off" required>
+      <p id="settings-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="save-settings" class="primary" type="submit">Сохранить ключ</button></div>
+    </form>
+    <section class="updates" aria-labelledby="updates-title">
+      <strong id="updates-title">Обновления Alicecode</strong>
+      <p id="update-status" class="muted" role="status"></p>
+      <div class="update-actions">
+        <button id="check-updates" class="quiet" type="button">Проверить обновления</button>
+        <button id="install-update" class="primary" type="button" hidden>Перезапустить и обновить</button>
+      </div>
+    </section>
+  </dialog>
+
+  <dialog id="preview-dialog" class="preview" aria-labelledby="preview-title">
+    <div class="dialog-header"><h2 id="preview-title"></h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <pre id="preview-content"></pre>
+  </dialog>
+  <div id="global-error" class="toast" role="alert" hidden></div>
+</body>
+</html>

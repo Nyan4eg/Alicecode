@@ -1,0 +1,22 @@
+{
+  "name": "alicecode",
+  "productName": "Alicecode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Windows coding workspace powered by Alice AI LLM and Grok Build.",
+  "author": "Nyan4eg",
+  "license": "MIT",
+  "repository": "https://github.com/Nyan4eg/Alicecode",
+  "main": "app/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.3.3",
+    "electron-builder": "26.18.0"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  }
+}

@@ -1,0 +1,29 @@
+appId: io.github.nyan4eg.alicecode
+productName: Alicecode
+artifactName: Alicecode-Setup-${version}-${arch}.${ext}
+directories:
+  output: dist
+files:
+  - app/**/*
+  - package.json
+extraResources:
+  - from: LICENSE
+    to: LICENSE.txt
+win:
+  icon: assets/alicecode.ico
+  target:
+    - target: nsis
+      arch: x64
+nsis:
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Alicecode
+  deleteAppDataOnUninstall: false
+publish:
+  provider: github
+  owner: Nyan4eg
+  repo: Alicecode
+  private: false
+  releaseType: release

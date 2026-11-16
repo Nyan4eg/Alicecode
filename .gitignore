@@ -1,0 +1,10 @@
+/.alice-runs/
+/node_modules/
+/dist/
+/.env
+/.env.*
+*.sqlite*
+*.log
+*.pfx
+*.pem
+*.key
