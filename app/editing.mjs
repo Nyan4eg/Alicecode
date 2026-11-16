@@ -52,7 +52,7 @@ async function fileLocation(root, target) {
   if (process.platform === 'win32' && typeof target === 'string') {
     target = target.replace(/^\\\\\?\\(?=[a-z]:\\)/i, '').replace(/^\\\\\?\\UNC\\/i, '\\\\');
   }
-  const path = projectPath(base, target);
+  const path = projectPath(root, target) ?? projectPath(base, target);
   if (!path || path.split('/').some(part => /[:*?"<>|]/.test(part) || /[. ]$/.test(part)
     || ['.git', 'node_modules', '.venv', '__pycache__'].includes(part.toLowerCase())
     || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) throw new Error(unavailable);

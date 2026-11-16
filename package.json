@@ -1,7 +1,7 @@
 {
   "name": "alicecode",
   "productName": "Alicecode",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "A Windows coding workspace powered by Alice AI LLM and Grok Build.",
   "author": "Nyan4eg",

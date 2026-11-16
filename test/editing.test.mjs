@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, toNamespacedPath } from 'node:path';
 import test from 'node:test';
@@ -8,9 +8,13 @@ import { agentTextForDisk, editableFile, planRollback, textForDisk, writeChecked
 import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from '../app/git.mjs';
 
 async function repo(t) {
-  const path = await mkdtemp(join(tmpdir(), 'alicecode-v05-'));
-  assert.equal(dirname(resolve(path)), resolve(tmpdir()));
-  t.after(() => rm(path, { recursive: true, force: true }));
+  const root = await mkdtemp(join(tmpdir(), 'alicecode-v05-'));
+  assert.equal(dirname(resolve(root)), resolve(tmpdir()));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const real = join(root, 'project');
+  const path = join(root, 'alias');
+  await mkdir(real);
+  await symlink(real, path, process.platform === 'win32' ? 'junction' : 'dir');
   const git = (...args) => execFileSync('git', args, { cwd: path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   git('init', '-q');
   for (const [key, value] of Object.entries({ 'core.autocrlf': 'false', 'user.email': 'qa@example.invalid',

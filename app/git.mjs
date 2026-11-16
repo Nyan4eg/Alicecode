@@ -20,7 +20,9 @@ async function changedFile(root, target) {
   if (!file) throw new Error('Список изменений обновился. Выберите файл заново.');
   if (unresolved.has((file.staged ?? ' ') + (file.unstaged ?? ' '))) throw new Error('Сначала разрешите конфликт Git.');
   const repo = await repositoryRoot(root);
-  return { file, repo, path: projectPath(repo, resolve(root, relative)) };
+  const path = projectPath(repo, resolve(await realpath(root), relative));
+  if (!path) throw new Error('Файл находится вне репозитория.');
+  return { file, repo, path };
 }
 
 export async function stageFile(root, target, staged) {
