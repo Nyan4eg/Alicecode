@@ -9,6 +9,8 @@ import { readPrototypeCredentials, validateCredentials } from './credentials.mjs
 import { createProject, listChanges, listFiles, readProjectDiff, readProjectFile } from './workspace.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate } from './activity.mjs';
+import { defaultModel, fetchModels, lookupModel, models } from './models.mjs';
+import { normalizeLayout } from './layout.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const cancelledPermission = () => ({ outcome: { outcome: 'cancelled' } });
@@ -22,6 +24,8 @@ let credentials;
 let credentialError;
 let runtime;
 let active;
+let available = models;
+let catalogStatus = 'loading';
 const updates = createUpdates(state => emit('app:update', state));
 
 function snapshot() {
@@ -29,6 +33,8 @@ function snapshot() {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
     busy: active?.chatId ?? null, permission: active?.permissions[0]?.details ?? null,
     updates: updates.snapshot(),
+    models: available, defaultModel: defaultModel.id, catalogStatus,
+    layout: normalizeLayout(JSON.parse(store.setting('layout') ?? '{}')),
     projectRoot: store.setting('projectRoot') ?? join(app.getPath('documents'), 'Alicecode Projects'),
   };
 }
@@ -49,6 +55,25 @@ async function saveCredentials(value) {
   closeRuntime();
   credentials = next;
   credentialError = null;
+  available = models;
+  catalogStatus = 'loading';
+}
+
+async function refreshModels() {
+  const source = credentials;
+  if (!source) return;
+  catalogStatus = 'loading';
+  emit('app:catalog', { models: available, catalogStatus });
+  try {
+    const result = await fetchModels(source);
+    if (credentials !== source) return;
+    available = result;
+    catalogStatus = 'ready';
+  } catch {
+    if (credentials !== source) return;
+    catalogStatus = 'error';
+  }
+  emit('app:catalog', { models: available, catalogStatus });
 }
 
 async function importCredentials() {
@@ -126,13 +151,21 @@ async function send(chatId, input) {
   const text = typeof input === 'string' ? input.trim() : '';
   if (!text || text.length > 40_000) throw new Error('Введите сообщение до 40 000 символов.');
   const chat = store.select(chatId);
-  const message = { id: store.beginTurn(chatId, text), chatId, role: 'assistant', text: '', tools: [], status: 'running' };
+  const model = lookupModel(chat.modelId) ?? defaultModel;
+  if (!available.some(item => item.id === model.id)) {
+    throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
+  }
+  const message = {
+    id: store.beginTurn(chatId, text, model.id), chatId, modelId: model.id,
+    role: 'assistant', text: '', tools: [], status: 'running',
+  };
   const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null };
   active = turn;
   emit('app:state', snapshot());
 
   try {
-    runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials);
+    if (runtime && runtime.modelId !== model.id) closeRuntime();
+    runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model);
     if (turn.stop) return;
     turn.client = new AcpClient(chat.cwd, runtime, {
       onUpdate: update => updateTurn(turn, update),
@@ -143,7 +176,7 @@ async function send(chatId, input) {
       clientInfo: { name: 'alicecode', title: 'Alicecode', version: app.getVersion() },
     });
     if (init._meta?.modelState?.currentModelId !== alias) {
-      throw new Error('Grok Build не выбрал модель Alice AI LLM Flash.');
+      throw new Error(`Grok Build не загрузил модель ${model.label}.`);
     }
     const params = { cwd: chat.cwd, mcpServers: [] };
     if (chat.sessionId) {
@@ -251,8 +284,20 @@ if (!app.requestSingleInstanceLock()) {
     });
     bind('project:read', (chatId, path) => readProjectFile(selectedPath(chatId), path));
     bind('project:diff', (chatId, path) => readProjectDiff(selectedPath(chatId), path));
+    bind('project:select', projectId => { store.selectProject(projectId); return snapshot(); });
+    bind('project:rename', (id, title) => { store.renameProject(id, title); return snapshot(); });
     bind('chat:new', projectId => { store.addChat(projectId); return snapshot(); });
     bind('chat:select', chatId => { store.select(chatId); return snapshot(); });
+    bind('chat:rename', (id, title) => { store.renameChat(id, title); return snapshot(); });
+    bind('chat:model', (id, modelId) => {
+      if (active?.chatId === id) throw new Error('Смените модель после завершения ответа.');
+      if (!available.some(model => model.id === modelId)) throw new Error('Модель недоступна в каталоге.');
+      store.setModel(id, modelId);
+      return snapshot();
+    });
+    bind('history:search', query => store.search(query));
+    bind('settings:layout', value => store.set('layout', JSON.stringify(normalizeLayout(value))));
+    bind('settings:models', refreshModels);
     bind('chat:send', send);
     bind('chat:stop', stop);
     bind('chat:permission', (id, allow) => resolvePermission(id, allow === true));
@@ -264,9 +309,11 @@ if (!app.requestSingleInstanceLock()) {
     bind('settings:save', async value => {
       if (active) throw new Error('Завершите текущую задачу перед сменой ключа.');
       await saveCredentials(value);
+      void refreshModels();
       return snapshot();
     });
     await makeWindow();
+    void refreshModels();
     updates.start();
   }).catch(error => {
     dialog.showErrorBox('Alicecode', error.message);

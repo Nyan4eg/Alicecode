@@ -12,6 +12,9 @@
   <aside class="sidebar" aria-label="Навигация">
     <div class="brand"><span class="mark" aria-hidden="true"></span><strong>Alicecode</strong></div>
     <button id="new-chat" class="primary new-chat" type="button" hidden>＋ Новый чат</button>
+    <button id="search-history" class="quiet search-trigger" type="button" aria-keyshortcuts="Control+k">
+      <span>Поиск по истории</span><kbd>Ctrl K</kbd>
+    </button>
     <div class="project-actions">
       <button id="create-project" class="quiet" type="button"><span aria-hidden="true">＋</span> Создать проект</button>
       <button id="open-project" class="quiet" type="button"><span aria-hidden="true">↗</span> Открыть папку</button>
@@ -20,6 +23,8 @@
     <nav id="projects" aria-label="Проекты и чаты"></nav>
     <button id="settings" class="quiet settings" type="button"><span aria-hidden="true">⚙</span> Настройки</button>
   </aside>
+  <div id="sidebar-grip" class="grip" role="separator" tabindex="0" aria-label="Ширина панели проектов"
+    aria-orientation="vertical" title="Перетащите или используйте стрелки. Двойной клик сбрасывает ширину."></div>
   <main class="workbench">
     <header class="topbar">
       <div class="heading">
@@ -27,8 +32,10 @@
         <span id="chat-title"></span>
       </div>
       <div class="top-actions">
-        <span id="provider" class="provider"><i aria-hidden="true"></i> Alice AI LLM Flash</span>
-        <button id="toggle-inspector" class="quiet icon" type="button" title="Показать или скрыть файлы" aria-label="Панель файлов" aria-expanded="true">◫</button>
+        <label id="provider" class="provider"><i aria-hidden="true"></i>
+          <select id="model" aria-label="Модель для чата"></select>
+        </label>
+        <button id="toggle-inspector" class="quiet icon" type="button" title="Панель файлов · Ctrl+Shift+E" aria-label="Панель файлов" aria-keyshortcuts="Control+Shift+e" aria-expanded="true">◫</button>
       </div>
     </header>
     <div class="panes">
@@ -61,6 +68,8 @@
           <div id="notice" class="notice" role="status" hidden></div>
         </div>
       </section>
+      <div id="inspector-grip" class="grip" role="separator" tabindex="0" aria-label="Ширина панели файлов"
+        aria-orientation="vertical" title="Перетащите или используйте стрелки. Двойной клик сбрасывает ширину."></div>
       <aside id="inspector" class="inspector" aria-label="Обозреватель проекта">
         <div class="explorer-heading">
           <strong>Рабочая папка</strong>
@@ -97,6 +106,26 @@
     </form>
   </dialog>
 
+  <dialog id="rename-dialog" aria-labelledby="rename-title">
+    <form id="rename-form">
+      <div class="dialog-header"><h2 id="rename-title"></h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <label for="rename-input">Название</label>
+      <input id="rename-input" maxlength="100" required>
+      <p id="rename-note" class="muted"></p>
+      <p id="rename-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Сохранить</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="history-dialog" class="history-dialog" aria-labelledby="history-title">
+    <div class="dialog-header"><h2 id="history-title">Поиск по истории</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <input id="history-query" aria-label="Название или фраза" type="search" placeholder="Название или фраза из чата" maxlength="120" autocomplete="off"
+      aria-controls="history-results" aria-autocomplete="list" aria-expanded="true" role="combobox">
+    <div id="history-status" class="muted history-status" role="status">Ищем по всем проектам и чатам.</div>
+    <div id="history-results" class="history-results" role="listbox" aria-label="Результаты поиска"></div>
+    <div class="history-keys"><kbd>↑</kbd> <kbd>↓</kbd> Выбрать <kbd>Enter</kbd> Открыть <kbd>Esc</kbd> Закрыть</div>
+  </dialog>
+
   <dialog id="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form">
       <div class="dialog-header"><h2 id="settings-title">Yandex AI Studio</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
@@ -108,6 +137,11 @@
       <p id="settings-error" class="error" role="alert" hidden></p>
       <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="save-settings" class="primary" type="submit">Сохранить ключ</button></div>
     </form>
+    <section class="updates" aria-labelledby="catalog-title">
+      <strong id="catalog-title">Каталог моделей</strong>
+      <p id="catalog-status" class="muted" role="status"></p>
+      <button id="refresh-models" class="quiet" type="button">Обновить список</button>
+    </section>
     <section class="updates" aria-labelledby="updates-title">
       <strong id="updates-title">Обновления Alicecode</strong>
       <p id="update-status" class="muted" role="status"></p>

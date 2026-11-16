@@ -5,9 +5,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { alias, modelUri, startAdapter } from './adapter.mjs';
+import { defaultModel } from './models.mjs';
 
-export async function startRuntime(home, credentials) {
-  const adapter = await startAdapter(credentials);
+export async function startRuntime(home, credentials, model = defaultModel) {
+  // Keep the ACP model alias stable so existing sessions can load after a model change.
+  const adapter = await startAdapter({ ...credentials, modelId: model.id });
   const dispose = () => {
     adapter.server.close();
     adapter.server.closeAllConnections();
@@ -18,9 +20,9 @@ export async function startRuntime(home, credentials) {
       '[cli]', 'auto_update = false',
       '[telemetry]', 'enabled = false',
       '[models]', `default = "${alias}"`,
-      `[model.${alias}]`, `model = "${modelUri(credentials.folderId)}"`,
+      `[model.${alias}]`, `model = "${modelUri(credentials.folderId, model.id)}"`,
       `base_url = "${adapter.baseUrl}"`, 'env_key = "ALICE_ADAPTER_TOKEN"',
-      'api_backend = "chat_completions"', 'temperature = 0', 'context_window = 65536',
+      'api_backend = "chat_completions"', 'temperature = 0', `context_window = ${model.context}`,
     ].join('\n') + '\n');
   } catch (error) {
     dispose();
@@ -37,7 +39,7 @@ export async function startRuntime(home, credentials) {
     GROK_MEMORY: '0',
     ALICE_ADAPTER_TOKEN: adapter.token,
   });
-  return { env, dispose };
+  return { env, dispose, modelId: model.id };
 }
 
 export class AcpClient {

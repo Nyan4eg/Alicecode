@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { defaultModel } from './models.mjs';
 
 const endpoint = 'https://ai.api.cloud.yandex.net/v1/chat/completions';
 export const alias = 'alice-ai-llm-flash';
-export const modelUri = folderId => `gpt://${folderId}/aliceai-llm-flash`;
+export const modelUri = (folderId, id = defaultModel.id) => `gpt://${folderId}/${id}`;
 
 async function* normalizeToolIds(body) {
   const ids = new Map();
@@ -30,8 +31,8 @@ async function* normalizeToolIds(body) {
   }
 }
 
-export async function startAdapter({ folderId, apiKey, track = false }) {
-  const model = modelUri(folderId);
+export async function startAdapter({ folderId, apiKey, modelId, track = false }) {
+  const model = modelUri(folderId, modelId);
   const token = randomUUID();
   const requests = [];
   const tools = new Map();

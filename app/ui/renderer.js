@@ -16,6 +16,13 @@ let previewRequest = 0;
 let permissionId;
 let createParent;
 let toastTimer;
+let layout;
+let renameTarget;
+let searchTimer;
+let searchRequest = 0;
+let searchResults = [];
+let selectedResult = -1;
+let searchHit = null;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -45,6 +52,15 @@ function activeChat() {
   return state?.chats.find(chat => chat.id === state.activeChat);
 }
 
+function renameButton(kind, item) {
+  const button = element('button', 'quiet rename-item', '✎');
+  button.type = 'button';
+  button.title = kind === 'project' ? 'Переименовать проект · Shift+F2' : 'Переименовать чат · F2';
+  button.setAttribute('aria-label', `${button.title.split(' · ')[0]} «${item.title}»`);
+  button.addEventListener('click', () => openRename(kind, item));
+  return button;
+}
+
 function renderNavigation() {
   const tree = $('projects');
   tree.replaceChildren();
@@ -56,15 +72,18 @@ function renderNavigation() {
     title.append(icon, document.createTextNode(project.title));
     title.title = project.path;
     const chats = state.chats.filter(chat => chat.projectId === project.id);
-    title.addEventListener('click', () => select(chats.some(chat => chat.id === state.activeChat)
-      ? state.activeChat : chats[0]?.id));
-    group.append(title);
+    title.addEventListener('click', () => selectProject(project.id));
+    const projectRow = element('div', 'nav-row');
+    projectRow.append(title, renameButton('project', project));
+    group.append(projectRow);
     for (const chat of chats) {
       const item = element('button', 'chat-item', chat.title);
       item.title = chat.title;
       item.setAttribute('aria-current', String(chat.id === state.activeChat));
       item.addEventListener('click', () => select(chat.id));
-      group.append(item);
+      const chatRow = element('div', 'nav-row chat-row');
+      chatRow.append(item, renameButton('chat', chat));
+      group.append(chatRow);
     }
     tree.append(group);
   }
@@ -194,6 +213,7 @@ function disclosure(key, title) {
 function renderMessage(message) {
   const row = element('article', `message ${message.role}`);
   row.dataset.messageId = message.id;
+  if (message.id === searchHit) row.classList.add('history-hit');
   if (message.role === 'user') {
     row.setAttribute('aria-label', 'Вы');
     row.append(formatMessage(message.text));
@@ -203,6 +223,8 @@ function renderMessage(message) {
   const mark = element('span', 'mark');
   mark.setAttribute('aria-hidden', 'true');
   role.append(mark, document.createTextNode('Алиса'));
+  if (message.modelId) role.append(element('span', 'model-label',
+    state.models.find(model => model.id === message.modelId)?.label ?? message.modelId));
   row.append(role);
   const paths = [...new Set(message.tools.filter(tool => tool.status === 'completed' && tool.decision !== 'denied')
     .flatMap(tool => tool.paths ?? []))];
@@ -242,11 +264,40 @@ function renderComposer() {
   const permission = state.permission;
   $('permission').hidden = !permission || permission.chatId !== chat?.id;
   renderPermission($('permission').hidden ? null : permission);
+  const available = state.models.some(model => model.id === (chat?.modelId ?? state.defaultModel));
   const notice = !state.configured ? state.credentialError ?? 'Подключите ключ Yandex AI Studio в настройках.'
+    : chat && !available ? 'Модель отсутствует в каталоге. Выберите другую.'
     : state.busy && state.busy !== chat?.id ? 'Алиса работает в другом чате.' : '';
   setText('notice', notice).hidden = !notice;
   $('prompt').disabled = !state.configured;
-  $('send').disabled = !chat || !state.configured || Boolean(state.busy) || !$('prompt').value.trim();
+  $('send').disabled = !chat || !state.configured || !available || Boolean(state.busy) || !$('prompt').value.trim();
+}
+
+function renderModels() {
+  const chat = activeChat();
+  const current = chat?.modelId ?? state.defaultModel;
+  const picker = $('model');
+  picker.replaceChildren();
+  for (const model of state.models) {
+    const option = element('option', '', model.label);
+    option.value = model.id;
+    picker.append(option);
+  }
+  if (!state.models.some(model => model.id === current)) {
+    const unavailable = element('option', '', `${current} · недоступна`);
+    unavailable.value = current;
+    unavailable.disabled = true;
+    picker.prepend(unavailable);
+  }
+  picker.value = current;
+  picker.disabled = !chat || !state.configured || state.busy === chat.id;
+  $('provider').classList.toggle('connected', state.configured);
+  picker.title = state.configured ? 'Выбрать модель для этого чата' : 'API-ключ не настроен';
+  setText('catalog-status', !state.configured ? 'Сохраните ключ, чтобы загрузить список.'
+    : state.catalogStatus === 'loading' ? 'Загружаем модели…'
+      : state.catalogStatus === 'error' ? 'Каталог недоступен. Показаны поддерживаемые модели.'
+        : `Совместимых моделей в вашем каталоге: ${state.models.length}.`);
+  $('refresh-models').disabled = !state.configured || state.catalogStatus === 'loading';
 }
 
 function renderPermission(permission) {
@@ -308,11 +359,16 @@ function updateState(next) {
   const changed = previous?.activeChat !== next.activeChat;
   if (changed && previous?.activeChat) drafts.set(previous.activeChat, $('prompt').value);
   state = next;
+  if (!layout) {
+    layout = { ...state.layout };
+    showInspector(layout.inspectorVisible, false);
+  }
   if (changed) {
     $('prompt').value = drafts.get(state.activeChat) ?? '';
     workspace = undefined;
     preview = undefined;
     previewRequest++;
+    searchHit = null;
     renderPreview();
   }
   const chat = activeChat();
@@ -321,8 +377,7 @@ function updateState(next) {
   setText('chat-title', chat?.title ?? '').title = chat?.title ?? '';
   $('new-chat').hidden = !chat;
   $('reveal').disabled = !chat;
-  $('provider').classList.toggle('connected', state.configured);
-  $('provider').title = state.configured ? 'Ключ Yandex AI Studio настроен' : 'API-ключ не настроен';
+  renderModels();
   renderNavigation();
   renderComposer();
   renderThread(changed);
@@ -336,20 +391,186 @@ async function select(chatId) {
   try { updateState(await api.selectChat(chatId)); } catch (error) { toast(error); }
 }
 
+async function selectProject(projectId) {
+  if (!projectId || activeChat()?.projectId === projectId) return;
+  try { updateState(await api.selectProject(projectId)); } catch (error) { toast(error); }
+}
+
+function openRename(kind, item) {
+  if (!item || $('rename-dialog').open) return;
+  renameTarget = { kind, id: item.id };
+  setText('rename-title', kind === 'project' ? 'Переименовать проект' : 'Переименовать чат');
+  setText('rename-note', 'Меняется название в Alicecode. Папка проекта остаётся на месте.').hidden = kind !== 'project';
+  $('rename-input').value = item.title;
+  $('rename-error').hidden = true;
+  $('rename-dialog').showModal();
+  $('rename-input').focus();
+  $('rename-input').select();
+}
+
+function renderSearchSelection() {
+  const rows = [...$('history-results').children];
+  rows.forEach((row, index) => row.setAttribute('aria-selected', String(index === selectedResult)));
+  const row = rows[selectedResult];
+  if (row) {
+    $('history-query').setAttribute('aria-activedescendant', row.id);
+    row.scrollIntoView({ block: 'nearest' });
+  } else {
+    $('history-query').removeAttribute('aria-activedescendant');
+  }
+}
+
+function renderSearch(results, status) {
+  searchResults = results;
+  selectedResult = results.length ? 0 : -1;
+  setText('history-status', status);
+  $('history-results').replaceChildren(...results.map((result, index) => {
+    const row = element('button', 'history-result');
+    row.id = `history-result-${index}`;
+    row.setAttribute('role', 'option');
+    row.tabIndex = -1;
+    row.type = 'button';
+    const kind = { project: 'Проект', chat: 'Чат', message: 'Сообщение' }[result.kind];
+    const location = [kind, result.kind !== 'project' && result.projectTitle,
+      result.kind === 'message' && result.chatTitle].filter(Boolean).join(' · ');
+    row.append(element('strong', '', result.snippet), element('small', '', location));
+    row.addEventListener('click', () => openSearchResult(result));
+    return row;
+  }));
+  renderSearchSelection();
+}
+
+function searchHistory() {
+  clearTimeout(searchTimer);
+  const id = ++searchRequest;
+  const query = $('history-query').value.trim();
+  if (!query) {
+    renderSearch([], 'Ищем по всем проектам и чатам.');
+    return;
+  }
+  renderSearch([], 'Поиск…');
+  searchTimer = setTimeout(async () => {
+    try {
+      const results = await api.search(query);
+      if (id !== searchRequest || !$('history-dialog').open) return;
+      renderSearch(results, results.length ? '' : 'Ничего не найдено.');
+    } catch (error) {
+      if (id === searchRequest) renderSearch([], errorText(error));
+    }
+  }, 125);
+}
+
+function openSearch() {
+  if (!$('history-dialog').open) $('history-dialog').showModal();
+  $('history-query').focus();
+  $('history-query').select();
+  searchHistory();
+}
+
+async function openSearchResult(result) {
+  if (!result) return;
+  try {
+    const next = result.chatId ? await api.selectChat(result.chatId) : await api.selectProject(result.projectId);
+    $('history-dialog').close();
+    updateState(next);
+    searchHit = result.messageId;
+    renderThread(false);
+    if (searchHit) document.querySelector(`[data-message-id="${searchHit}"]`)?.scrollIntoView({ block: 'center' });
+    $('prompt').focus({ preventScroll: true });
+  } catch (error) { toast(error); }
+}
+
 function selectTab(next) {
   tab = next;
   $('files-tab').setAttribute('aria-selected', String(tab === 'files'));
   $('changes-tab').setAttribute('aria-selected', String(tab === 'changes'));
 }
 
-function showInspector(visible) {
+function showInspector(visible, persist = true) {
+  layout.inspectorVisible = visible;
   $('inspector').hidden = !visible;
+  $('inspector-grip').hidden = !visible;
   $('toggle-inspector').setAttribute('aria-expanded', String(visible));
+  renderLayout();
+  if (persist) saveLayout();
+}
+
+function bounds(key) {
+  if (key === 'sidebar') return [150, Math.min(420, window.innerWidth - 470)];
+  const left = $('sidebar-grip').previousElementSibling.getBoundingClientRect().width;
+  return [180, Math.max(180, Math.min(720, window.innerWidth - left - 304))];
+}
+
+function clampWidth(key, width) {
+  const [min, max] = bounds(key);
+  return Math.min(max, Math.max(min, Math.round(width)));
+}
+
+function renderLayout() {
+  if (!layout) return;
+  const compact = window.innerWidth <= 850;
+  const medium = window.innerWidth <= 1000;
+  const defaults = { sidebar: compact ? 165 : medium ? 190 : 231,
+    inspector: preview ? compact ? 280 : Math.max(340, Math.min(580, window.innerWidth * .33))
+      : compact ? 180 : medium ? 210 : 255 };
+  for (const key of ['sidebar', 'inspector']) {
+    const width = clampWidth(key, layout[key] ?? defaults[key]);
+    document.body.style.setProperty(`--${key}-width`, `${width}px`);
+    const grip = $(`${key}-grip`);
+    const [min, max] = bounds(key);
+    grip.setAttribute('aria-valuenow', width);
+    grip.setAttribute('aria-valuemin', min);
+    grip.setAttribute('aria-valuemax', max);
+  }
+}
+
+function saveLayout() {
+  api.saveLayout(layout).catch(toast);
+}
+
+function bindGrip(key, direction) {
+  const grip = $(`${key}-grip`);
+  let start;
+  grip.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || !layout) return;
+    event.preventDefault();
+    grip.setPointerCapture(event.pointerId);
+    start = { x: event.clientX, width: Number(grip.getAttribute('aria-valuenow')) };
+    grip.classList.add('dragging');
+    document.body.classList.add('resizing');
+  });
+  grip.addEventListener('pointermove', event => {
+    if (!start || event.clientX === start.x && layout[key] === null) return;
+    layout[key] = clampWidth(key, start.width + direction * (event.clientX - start.x));
+    renderLayout();
+  });
+  grip.addEventListener('lostpointercapture', () => {
+    if (!start) return;
+    start = null;
+    grip.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    saveLayout();
+  });
+  grip.addEventListener('keydown', event => {
+    if (!layout || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowRight' ? 16 : -16;
+    layout[key] = clampWidth(key, Number(grip.getAttribute('aria-valuenow')) + direction * delta);
+    renderLayout();
+    saveLayout();
+  });
+  grip.addEventListener('dblclick', () => {
+    if (!layout) return;
+    layout[key] = null;
+    renderLayout();
+    saveLayout();
+  });
 }
 
 function renderPreview() {
   $('inline-preview').hidden = !preview;
   $('inspector').classList.toggle('reviewing', Boolean(preview));
+  renderLayout();
   if (!preview) return;
   setText('preview-title', preview.path).title = preview.path;
   setText('preview-mode', preview.mode === 'changes' ? 'Изменения в Git' : 'Файл');
@@ -395,7 +616,7 @@ function renderPreview() {
 async function openPreview(path, mode) {
   if (!state.activeChat) return;
   const id = ++previewRequest;
-  showInspector(true);
+  if (!layout.inspectorVisible) showInspector(true);
   selectTab(mode);
   preview = { path, mode, loading: true };
   renderPreview();
@@ -472,6 +693,12 @@ api.onUpdate(update => {
   state.updates = update;
   renderUpdates();
 });
+api.onCatalog(catalog => {
+  if (!state) return;
+  Object.assign(state, catalog);
+  renderModels();
+  renderComposer();
+});
 api.onMessage(message => {
   if (message.chatId !== state?.activeChat) return;
   const index = state.messages.findIndex(item => item.id === message.id);
@@ -512,11 +739,59 @@ $('project-form').addEventListener('submit', async event => {
 $('open-project').addEventListener('click', async () => {
   try { updateState(await api.openProject()); } catch (error) { toast(error); }
 });
-$('new-chat').addEventListener('click', async () => {
+$('search-history').addEventListener('click', openSearch);
+$('history-query').addEventListener('input', searchHistory);
+$('history-query').addEventListener('keydown', event => {
+  if (!searchResults.length) return;
+  if (['ArrowUp', 'ArrowDown'].includes(event.key)) {
+    event.preventDefault();
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    selectedResult = (selectedResult + delta + searchResults.length) % searchResults.length;
+    renderSearchSelection();
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    openSearchResult(searchResults[selectedResult]);
+  }
+});
+$('history-dialog').addEventListener('close', () => {
+  clearTimeout(searchTimer);
+  searchRequest++;
+});
+
+$('rename-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!renameTarget) return;
+  const save = event.submitter ?? $('rename-form').querySelector('[type="submit"]');
+  save.disabled = true;
   try {
-    updateState(await api.newChat(activeChat().projectId));
+    const rename = renameTarget.kind === 'project' ? api.renameProject : api.renameChat;
+    updateState(await rename(renameTarget.id, $('rename-input').value));
+    $('rename-dialog').close();
+  } catch (error) {
+    setText('rename-error', errorText(error)).hidden = false;
+  } finally {
+    save.disabled = false;
+  }
+});
+
+async function newChat() {
+  const chat = activeChat();
+  if (!chat) return;
+  try {
+    updateState(await api.newChat(chat.projectId));
     $('prompt').focus();
   } catch (error) { toast(error); }
+}
+$('new-chat').addEventListener('click', newChat);
+$('new-chat').setAttribute('aria-keyshortcuts', 'Control+n');
+$('new-chat').title = 'Новый чат · Ctrl+N';
+$('model').addEventListener('change', async () => {
+  try {
+    updateState(await api.selectModel(activeChat().id, $('model').value));
+  } catch (error) {
+    renderModels();
+    toast(error);
+  }
 });
 $('settings').addEventListener('click', () => {
   $('settings-form').reset();
@@ -540,6 +815,7 @@ $('settings-form').addEventListener('submit', async event => {
 });
 $('check-updates').addEventListener('click', () => api.checkUpdates().catch(toast));
 $('install-update').addEventListener('click', () => api.installUpdate().catch(toast));
+$('refresh-models').addEventListener('click', () => api.refreshModels().catch(toast));
 for (const button of document.querySelectorAll('.close-dialog')) {
   button.addEventListener('click', () => button.closest('dialog').close());
 }
@@ -585,6 +861,29 @@ $('reveal').addEventListener('click', async () => {
 });
 $('toggle-inspector').addEventListener('click', () => {
   showInspector($('inspector').hidden);
+});
+bindGrip('sidebar', 1);
+bindGrip('inspector', -1);
+window.addEventListener('resize', renderLayout);
+document.addEventListener('keydown', event => {
+  if (!state || event.altKey || event.isComposing || event.repeat) return;
+  const modal = document.querySelector('dialog[open]');
+  if (modal && modal.id !== 'history-dialog') return;
+  if (event.ctrlKey && !event.shiftKey && event.code === 'KeyK') {
+    event.preventDefault();
+    openSearch();
+  } else if (!modal && event.ctrlKey && !event.shiftKey && event.code === 'KeyN' && activeChat()) {
+    event.preventDefault();
+    newChat();
+  } else if (!modal && event.key === 'F2' && !event.ctrlKey && activeChat()) {
+    event.preventDefault();
+    const chat = activeChat();
+    if (event.shiftKey) openRename('project', state.projects.find(project => project.id === chat.projectId));
+    else openRename('chat', chat);
+  } else if (!modal && event.ctrlKey && event.shiftKey && event.code === 'KeyE') {
+    event.preventDefault();
+    showInspector($('inspector').hidden);
+  }
 });
 $('close-preview').addEventListener('click', closePreview);
 for (const name of ['files', 'changes']) {
