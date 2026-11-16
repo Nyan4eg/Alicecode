@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { normalizeLayout } from '../app/layout.mjs';
 import { availableModels } from '../app/models.mjs';
@@ -47,6 +50,41 @@ test('a chat model and the model of each answer are independent', t => {
   assert.equal(store.snapshot().messages.find(item => item.id === answer).modelId, 'aliceai-llm-flash');
 });
 
+test('existing chats keep their effective model and new chats start with Qwen after an upgrade', t => {
+  const root = mkdtempSync(join(tmpdir(), 'alicecode-model-upgrade-'));
+  const database = join(root, 'alicecode.sqlite');
+  let store = new Store(database);
+  t.after(() => {
+    store.db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const implicit = store.addProject('Калькулятор', 'C:/work/calculator');
+  const explicit = store.addChat(implicit.projectId);
+  store.setModel(implicit.id, null); // The previous release used Flash for this row.
+  store.setModel(explicit.id, 'deepseek-v4.1-flash');
+  store.setSession(explicit.id, 'existing-session');
+  const answer = store.beginTurn(explicit.id, 'Проверь калькулятор.', 'deepseek-v4.1-flash');
+  store.saveTurn(answer, { text: 'Готово.', status: 'done', tools: [] });
+  store.db.close();
+
+  store = new Store(database);
+  assert.equal(store.chat(implicit.id).modelId, 'aliceai-llm-flash');
+  assert.equal(store.chat(explicit.id).modelId, 'deepseek-v4.1-flash');
+  assert.equal(store.chat(explicit.id).sessionId, 'existing-session');
+  assert.equal(store.snapshot().messages.at(-1).text, 'Готово.');
+  const newChat = store.addChat(implicit.projectId);
+  assert.equal(newChat.modelId, 'qwen3.6-35b-a3b');
+  assert.equal(store.addProject('Другой проект', 'C:/work/other').modelId, 'qwen3.6-35b-a3b');
+  store.setModel(newChat.id, 'yandexgpt-5.1');
+  store.db.close();
+
+  store = new Store(database);
+  assert.equal(store.chat(implicit.id).modelId, 'aliceai-llm-flash');
+  assert.equal(store.chat(newChat.id).modelId, 'yandexgpt-5.1');
+  assert.equal(store.addChat(implicit.projectId).modelId, 'qwen3.6-35b-a3b');
+});
+
 test('catalog only lists verified text models available to the current folder', () => {
   const entries = [
     { id: 'gpt://folder/aliceai-llm-flash/latest' },
@@ -59,7 +97,7 @@ test('catalog only lists verified text models available to the current folder', 
     { id: 'gpt://folder/qwen3.6-35b-a3b/latest' },
   ];
   assert.deepEqual(availableModels(entries, 'folder').map(model => model.id),
-    ['aliceai-llm-flash', 'yandexgpt-5-pro', 'qwen3.6-35b-a3b']);
+    ['qwen3.6-35b-a3b', 'yandexgpt-5-pro', 'aliceai-llm-flash']);
 });
 
 test('layout preferences clamp invalid widths and persist inspector visibility', () => {

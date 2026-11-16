@@ -3,11 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { defaultModel } from './models.mjs';
+import { legacyModel } from './models.mjs';
 
 const endpoint = 'https://ai.api.cloud.yandex.net/v1/chat/completions';
 export const alias = 'alice-ai-llm-flash';
-export const modelUri = (folderId, id = defaultModel.id) => `gpt://${folderId}/${id}`;
+export const modelUri = (folderId, id = legacyModel.id) => `gpt://${folderId}/${id}`;
 
 async function* normalizeToolIds(body) {
   const ids = new Map();

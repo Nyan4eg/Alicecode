@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
+import { defaultModel, legacyModel } from './models.mjs';
 
 const fold = value => value.normalize('NFKC').toLocaleLowerCase('ru').replaceAll('ё', 'е').replace(/\s+/g, ' ');
 
@@ -40,6 +41,7 @@ export class Store {
     `);
     this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT' });
     this.addColumns('messages', { modelId: 'TEXT' });
+    this.db.prepare('UPDATE chats SET modelId=? WHERE modelId IS NULL').run(legacyModel.id);
     this.db.function('search_fold', { deterministic: true }, fold);
   }
 
@@ -77,8 +79,8 @@ export class Store {
 
   addChat(projectId) {
     const id = randomUUID();
-    this.db.prepare("INSERT INTO chats (id, projectId, title, updatedAt) VALUES (?, ?, 'Новый чат', ?)")
-      .run(id, projectId, Date.now());
+    this.db.prepare("INSERT INTO chats (id, projectId, title, updatedAt, modelId) VALUES (?, ?, 'Новый чат', ?, ?)")
+      .run(id, projectId, Date.now(), defaultModel.id);
     return this.select(id);
   }
 

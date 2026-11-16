@@ -60,7 +60,7 @@ kbd { white-space: nowrap; font: 11px var(--code); padding: 1px 4px; border: 1px
 .provider { display: flex; align-items: center; margin: 0; white-space: nowrap; color: #585066; font-size: 12px; }
 .provider i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #9d94a8; margin-right: 5px; }
 .provider.connected i { background: #28976b; }
-.provider select { max-width: 210px; min-width: 0; padding: 4px 5px; border-radius: 7px; border: 1px solid var(--line); color: inherit; background: #faf8fd; }
+.provider select { max-width: min(320px, 34vw); min-width: 0; padding: 4px 5px; border-radius: 7px; border: 1px solid var(--line); color: inherit; background: #faf8fd; }
 .grip { width: 6px; flex: 0 0 6px; cursor: col-resize; background: #f1eef5; touch-action: none; }
 .grip:hover, .grip:focus-visible, .grip.dragging { background: #cbb8f3; outline: 0; }
 body.resizing { cursor: col-resize; user-select: none; }

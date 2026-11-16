@@ -279,7 +279,7 @@ function renderModels() {
   const picker = $('model');
   picker.replaceChildren();
   for (const model of state.models) {
-    const option = element('option', '', model.label);
+    const option = element('option', '', `${model.label} · ${model.badge}`);
     option.value = model.id;
     picker.append(option);
   }
@@ -292,7 +292,11 @@ function renderModels() {
   picker.value = current;
   picker.disabled = !chat || !state.configured || state.busy === chat.id;
   $('provider').classList.toggle('connected', state.configured);
-  picker.title = state.configured ? 'Выбрать модель для этого чата' : 'API-ключ не настроен';
+  const selected = state.models.find(model => model.id === current);
+  const time = selected?.medianSeconds?.toLocaleString('ru-RU');
+  picker.title = !state.configured ? 'API-ключ не настроен'
+    : time ? `${selected.label}. Тест на калькуляторе: 3 из 3, медиана ${time} с.`
+      : 'Выбрать модель для этого чата';
   setText('catalog-status', !state.configured ? 'Сохраните ключ, чтобы загрузить список.'
     : state.catalogStatus === 'loading' ? 'Загружаем модели…'
       : state.catalogStatus === 'error' ? 'Каталог недоступен. Показаны поддерживаемые модели.'

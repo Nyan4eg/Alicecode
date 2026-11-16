@@ -9,7 +9,7 @@ import { readPrototypeCredentials, validateCredentials } from './credentials.mjs
 import { createProject, listChanges, listFiles, readProjectDiff, readProjectFile } from './workspace.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate } from './activity.mjs';
-import { defaultModel, fetchModels, lookupModel, models } from './models.mjs';
+import { defaultModel, fetchModels, legacyModel, lookupModel, models } from './models.mjs';
 import { normalizeLayout } from './layout.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
@@ -151,8 +151,8 @@ async function send(chatId, input) {
   const text = typeof input === 'string' ? input.trim() : '';
   if (!text || text.length > 40_000) throw new Error('Введите сообщение до 40 000 символов.');
   const chat = store.select(chatId);
-  const model = lookupModel(chat.modelId) ?? defaultModel;
-  if (!available.some(item => item.id === model.id)) {
+  const model = lookupModel(chat.modelId ?? legacyModel.id);
+  if (!model || !available.some(item => item.id === model.id)) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
   const message = {
