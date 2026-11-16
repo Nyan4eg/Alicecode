@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
+import { projectPath } from './activity.mjs';
 
 const exec = promisify(execFile);
 const omitted = new Set(['.git', 'node_modules', '.venv', '__pycache__']);
@@ -57,26 +58,58 @@ export async function readProjectFile(root, target) {
   return content;
 }
 
-export async function listChanges(root) {
-  const git = async args => (await exec('git', args, {
+function gitIn(root, args) {
+  return exec('git', ['--literal-pathspecs', ...args], {
     cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 2_000_000,
-  })).stdout;
-  const prefix = (await git(['rev-parse', '--show-prefix']).catch(() => null))?.trim();
-  if (prefix !== '') return [];
+  }).then(result => result.stdout);
+}
 
-  const hasHead = await git(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false);
-  const diff = hasHead
-    ? await git(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--', '.'])
-    : (await git(['diff', '--no-ext-diff', '--no-textconv', '--cached', '--', '.']))
-      + (await git(['diff', '--no-ext-diff', '--no-textconv', '--', '.']));
-  const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z']);
-  const added = untracked.split('\0').filter(Boolean).slice(0, 50);
-  const changes = diff ? [{ name: 'Изменения Git', diff }] : [];
-  for (const name of added) {
-    const text = await readProjectFile(root, name).catch(() => null);
-    changes.push({
-      name, diff: text === null ? 'Новый файл' : text.split(/\r?\n/).map(line => '+' + line).join('\n'),
-    });
+async function trackedDiff(root, flags, path) {
+  const head = await gitIn(root, ['rev-parse', '--verify', 'HEAD']).then(() => true, () => false);
+  const args = ['diff', '--relative', '--no-renames', '--no-ext-diff', '--no-textconv', ...flags];
+  if (head) return [await gitIn(root, [...args, 'HEAD', '--', path])];
+  return Promise.all([
+    gitIn(root, [...args, '--cached', '--', path]),
+    gitIn(root, [...args, '--', path]),
+  ]);
+}
+
+function untrackedFiles(root, path) {
+  return gitIn(root, ['ls-files', '--others', '--exclude-standard', '-z', '--', path])
+    .then(stdout => stdout.split('\0').filter(Boolean));
+}
+
+export async function listChanges(root) {
+  const inGit = await gitIn(root, ['rev-parse', '--is-inside-work-tree']).catch(() => '');
+  if (inGit.trim() !== 'true') return [];
+  const [tracked, untracked] = await Promise.all([
+    trackedDiff(root, ['--name-status', '-z'], '.'),
+    untrackedFiles(root, '.'),
+  ]);
+  const changes = new Map();
+  for (const statusList of tracked) {
+    const fields = statusList.split('\0');
+    for (let index = 0; index < fields.length - 1; index += 2) {
+      const [status, path] = fields.slice(index, index + 2);
+      const previous = changes.get(path);
+      if (previous?.status === 'A' && status === 'D') changes.delete(path);
+      else if (previous?.status !== 'A') changes.set(path, { path, status });
+    }
   }
-  return changes;
+  for (const path of untracked) {
+    if (!changes.has(path)) changes.set(path, { path, status: '?' });
+  }
+  return [...changes.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+export async function readProjectDiff(root, target) {
+  const path = projectPath(root, target);
+  if (!path) throw new Error('Файл находится вне проекта.');
+  const diff = (await trackedDiff(root, [], path)).join('');
+  if (diff) return diff;
+  if (!(await untrackedFiles(root, path)).includes(path)) return '';
+  const text = await readProjectFile(root, path);
+  if (!text) return 'Новый пустой файл';
+  const lines = text.replace(/\r?\n$/, '').split(/\r?\n/);
+  return [`@@ -0,0 +1,${lines.length} @@`, ...lines.map(line => '+' + line)].join('\n');
 }

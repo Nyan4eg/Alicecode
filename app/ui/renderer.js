@@ -11,6 +11,9 @@ let state;
 let workspace;
 let workspaceRequest = 0;
 let tab = 'files';
+let preview;
+let previewRequest = 0;
+let permissionId;
 let createParent;
 let toastTimer;
 
@@ -67,7 +70,30 @@ function renderNavigation() {
   }
 }
 
-function formatMessage(text) {
+function findReference(value, paths) {
+  let normalized = value;
+  try { normalized = decodeURIComponent(value); } catch {}
+  normalized = normalized.replaceAll('\\', '/').replace(/^file:\/\/\//i, '')
+    .replace(/^\/(?=[a-z]:\/)/i, '').replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '');
+  const project = state.projects.find(item => item.id === activeChat()?.projectId);
+  const root = project && project.path.replaceAll('\\', '/').replace(/\/$/, '') + '/';
+  if (root && normalized.toLowerCase().startsWith(root.toLowerCase())) normalized = normalized.slice(root.length);
+  const direct = paths.find(path => path.toLowerCase() === normalized.toLowerCase());
+  if (direct || normalized.includes('/') || normalized.includes(':')) return direct;
+  const matches = paths.filter(path => path.toLowerCase().split('/').at(-1) === normalized.toLowerCase());
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function fileLink(path, label = path, preferDiff = false) {
+  const button = element('button', 'file-link', label);
+  button.type = 'button';
+  button.title = path;
+  button.addEventListener('click', () => openPreview(path, preferDiff || workspace?.changes.some(change => change.path === path)
+    ? 'changes' : 'files'));
+  return button;
+}
+
+function formatMessage(text, paths = [], changed = []) {
   const container = element('div', 'message-text');
   const parts = text.split(/(?:^|\n)```[^\n]*\n|\n```(?=\n|$)/);
   for (const [i, part] of parts.entries()) {
@@ -75,12 +101,94 @@ function formatMessage(text) {
       container.append(element('pre', '', part));
       continue;
     }
-    const source = part.replace(/\[([^\]\n]+)\]\([^\n)]+\)/g, '$1');
-    for (const [index, segment] of source.split('`').entries()) {
-      container.append(index % 2 ? element('code', '', segment) : document.createTextNode(segment));
+    let end = 0;
+    const tokens = /\[([^\]\n]+)\]\(([^\n)]+)\)|`([^`\n]+)`|(?<![\p{L}\p{N}_.])([\p{L}\p{N}_./\\-]+\.[\p{L}\p{N}_-]{1,15})(?=[\s,.:;!?()[\]]|$)/gu;
+    for (const match of part.matchAll(tokens)) {
+      const [, label, target, code, bare] = match;
+      container.append(document.createTextNode(part.slice(end, match.index)));
+      const reference = findReference(target ?? code ?? bare, paths) ?? (label && findReference(label, paths));
+      if (reference) container.append(fileLink(reference, label ?? code ?? bare, changed.includes(reference)));
+      else if (code) container.append(element('code', '', code));
+      else container.append(document.createTextNode(label ?? bare));
+      end = match.index + match[0].length;
     }
+    container.append(document.createTextNode(part.slice(end)));
   }
   return container;
+}
+
+function actionOutcome(tool) {
+  if (tool.decision === 'denied') return ['Отклонено', 'failed'];
+  if (tool.interrupted) return ['Прервано', 'failed'];
+  if (tool.background) return ['В фоне', 'neutral'];
+  if (tool.status === 'completed' || tool.status === 'failed') {
+    if (Number.isInteger(tool.exitCode)) {
+      return tool.exitCode === 0 ? ['Код 0', 'success'] : [`Код ${tool.exitCode} · ошибка`, 'failed'];
+    }
+    if (tool.status === 'completed' && executedCommand(tool)) return ['Без кода выхода', 'neutral'];
+  }
+  return [statusLabels[tool.status] ?? 'Ожидает', tool.status === 'failed' ? 'failed' : 'neutral'];
+}
+
+function executedCommand(tool) {
+  return tool.command ?? (tool.kind === 'execute' ? /^Execute `(.+)`$/s.exec(tool.title)?.[1] : undefined);
+}
+
+function workSummary(message, paths) {
+  const panel = element('section', 'work-summary');
+  panel.setAttribute('aria-label', 'Ход работы');
+  const tools = message.tools.map(tool => message.status === 'cancelled' && ['pending', 'in_progress'].includes(tool.status)
+    ? { ...tool, interrupted: true } : tool);
+  const commands = tools.filter(executedCommand);
+  const testRuns = commands.filter(tool => tool.tests || /\b(?:node\s+--test|npm\s+(?:run\s+)?test|pytest|vitest|jest|cargo\s+test|go\s+test)\b/.test(executedCommand(tool)));
+  const head = element('div', 'work-heading');
+  head.append(element('strong', '', 'Ход работы'));
+  head.append(element('span', 'work-meta',
+    [paths.length && `Файлы · ${paths.length}`, commands.length && `Команды · ${commands.length}`].filter(Boolean).join('  /  ')));
+  panel.append(head);
+  if (testRuns.length) {
+    const runs = element('ol', 'test-runs');
+    for (const [index, tool] of testRuns.entries()) {
+      const [label, tone] = actionOutcome(tool);
+      const row = element('li', 'test-run');
+      row.append(element('span', 'run-index', String(index + 1)), element('code', '', executedCommand(tool)));
+      if (tool.tests) {
+        row.append(element('span', 'test-counts', `Прошло ${tool.tests.passed} из ${tool.tests.total}`
+          + (tool.tests.failed ? ` · ошибок ${tool.tests.failed}` : '')));
+      }
+      row.append(element('span', `outcome ${tone}`, label));
+      runs.append(row);
+    }
+    panel.append(runs);
+  }
+  if (paths.length) {
+    const files = element('div', 'work-files');
+    for (const path of paths) files.append(fileLink(path, path, true));
+    panel.append(files);
+  }
+  const journal = disclosure(`${message.id}:journal`, `Журнал действий · ${tools.length}`);
+  const list = element('div', 'tool-list');
+  for (const tool of tools) {
+    const details = disclosure(`${message.id}:${tool.id}`, executedCommand(tool) ?? tool.title);
+    const [label, tone] = actionOutcome(tool);
+    details.querySelector('summary').append(element('span', `outcome ${tone}`, label));
+    if (tool.output) details.append(element('pre', 'tool-output', tool.output));
+    list.append(details);
+  }
+  journal.append(list);
+  panel.append(journal);
+  return panel;
+}
+
+function disclosure(key, title) {
+  const details = element('details');
+  details.open = openTools.has(key);
+  details.addEventListener('toggle', () => {
+    if (details.open) openTools.add(key);
+    else openTools.delete(key);
+  });
+  details.append(element('summary', '', title));
+  return details;
 }
 
 function renderMessage(message) {
@@ -96,25 +204,11 @@ function renderMessage(message) {
   mark.setAttribute('aria-hidden', 'true');
   role.append(mark, document.createTextNode('Алиса'));
   row.append(role);
-  if (message.tools.length) {
-    const list = element('div', 'tool-list');
-    for (const tool of message.tools) {
-      const details = element('details');
-      const key = `${message.id}:${tool.id}`;
-      details.open = openTools.has(key);
-      details.addEventListener('toggle', () => {
-        if (details.open) openTools.add(key);
-        else openTools.delete(key);
-      });
-      const summary = element('summary', '', tool.title);
-      summary.append(element('span', 'tool-status', statusLabels[tool.status] ?? ''));
-      details.append(summary);
-      if (tool.output) details.append(element('pre', 'tool-output', tool.output));
-      list.append(details);
-    }
-    row.append(list);
-  }
-  row.append(formatMessage(message.text));
+  const paths = [...new Set(message.tools.filter(tool => tool.status === 'completed' && tool.decision !== 'denied')
+    .flatMap(tool => tool.paths ?? []))];
+  const references = [...new Set([...paths, ...(workspace?.files ?? []), ...(workspace?.changes ?? []).map(item => item.path)])];
+  if (message.tools.length) row.append(workSummary(message, paths));
+  row.append(formatMessage(message.text, references, paths));
   if (message.error) row.append(element('p', 'error', message.error));
   if (message.status === 'cancelled') row.append(element('p', 'busy-text', 'Задача остановлена.'));
   if (message.status === 'running' && !message.text) row.append(element('p', 'busy-text', 'Алиса работает…'));
@@ -147,15 +241,46 @@ function renderComposer() {
   $('stop').hidden = state.busy !== chat?.id;
   const permission = state.permission;
   $('permission').hidden = !permission || permission.chatId !== chat?.id;
-  if (!$('permission').hidden) {
-    setText('permission-title', permission.title);
-    setText('permission-input', permission.input).hidden = !permission.input;
-  }
+  renderPermission($('permission').hidden ? null : permission);
   const notice = !state.configured ? state.credentialError ?? 'Подключите ключ Yandex AI Studio в настройках.'
     : state.busy && state.busy !== chat?.id ? 'Алиса работает в другом чате.' : '';
   setText('notice', notice).hidden = !notice;
   $('prompt').disabled = !state.configured;
   $('send').disabled = !chat || !state.configured || Boolean(state.busy) || !$('prompt').value.trim();
+}
+
+function renderPermission(permission) {
+  if (permissionId === permission?.id) return;
+  permissionId = permission?.id;
+  if (!permission) return;
+  setText('permission-title', permission.title);
+  const content = $('permission-details');
+  content.replaceChildren();
+  $('allow').disabled = $('deny').disabled = false;
+  if (permission.kind === 'command') {
+    content.append(element('pre', 'permission-command', permission.command),
+      element('div', 'permission-field', permission.directoryLabel),
+      element('code', 'permission-path', permission.directory));
+  } else if (permission.kind === 'edit') {
+    for (const change of permission.changes) {
+      const entry = element('div', 'permission-edit');
+      entry.append(element('code', 'permission-path', change.path));
+      if (change.before) {
+        entry.append(element('div', 'permission-field', 'Было'), element('pre', 'permission-before', change.before));
+      }
+      if (typeof change.after === 'string') {
+        entry.append(element('div', 'permission-field', 'Станет'), element('pre', 'permission-after', change.after || 'Пустой текст'));
+      }
+      content.append(entry);
+    }
+  } else {
+    content.append(element('div', '', permission.action));
+    if (permission.detail) {
+      const details = element('details');
+      details.append(element('summary', '', 'Параметры'), element('pre', '', permission.detail));
+      content.append(details);
+    }
+  }
 }
 
 function renderUpdates() {
@@ -186,6 +311,9 @@ function updateState(next) {
   if (changed) {
     $('prompt').value = drafts.get(state.activeChat) ?? '';
     workspace = undefined;
+    preview = undefined;
+    previewRequest++;
+    renderPreview();
   }
   const chat = activeChat();
   const project = state.projects.find(item => item.id === chat?.projectId);
@@ -208,17 +336,86 @@ async function select(chatId) {
   try { updateState(await api.selectChat(chatId)); } catch (error) { toast(error); }
 }
 
-function showPreview(name, text, diff = false) {
-  setText('preview-title', name);
-  const preview = $('preview-content');
-  preview.textContent = diff ? '' : text;
-  if (diff) {
-    for (const line of text.split('\n')) {
-      const style = line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : '';
-      preview.append(element('span', style, line), document.createTextNode('\n'));
-    }
+function selectTab(next) {
+  tab = next;
+  $('files-tab').setAttribute('aria-selected', String(tab === 'files'));
+  $('changes-tab').setAttribute('aria-selected', String(tab === 'changes'));
+}
+
+function showInspector(visible) {
+  $('inspector').hidden = !visible;
+  $('toggle-inspector').setAttribute('aria-expanded', String(visible));
+}
+
+function renderPreview() {
+  $('inline-preview').hidden = !preview;
+  $('inspector').classList.toggle('reviewing', Boolean(preview));
+  if (!preview) return;
+  setText('preview-title', preview.path).title = preview.path;
+  setText('preview-mode', preview.mode === 'changes' ? 'Изменения в Git' : 'Файл');
+  const body = $('preview-content');
+  body.setAttribute('aria-label', preview.mode === 'changes' ? 'Изменения файла' : 'Содержимое файла');
+  body.replaceChildren();
+  if (preview.loading || preview.error || !preview.text) {
+    body.textContent = preview.loading ? 'Загрузка…' : preview.error
+      ?? (preview.mode === 'changes' ? 'Изменений для этого файла нет.' : 'Пустой файл.');
+    return;
   }
-  $('preview-dialog').showModal();
+
+  const lines = preview.text.replace(/\r?\n$/, '').split(/\r?\n/);
+  let number = preview.mode === 'files' ? 1 : null;
+  for (const line of lines.slice(0, 3000)) {
+    let tone = '';
+    let label = '';
+    if (preview.mode === 'changes') {
+      const hunk = /^@@ .+ \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hunk) {
+        number = Number(hunk[1]);
+        tone = 'diff-info';
+      } else if (line.startsWith('+++ ') || line.startsWith('--- ') || line.startsWith('diff ') || line.startsWith('index ')) {
+        tone = 'diff-info';
+      } else if (line.startsWith('-')) {
+        tone = 'diff-remove';
+      } else if (line.startsWith('+') || line.startsWith(' ')) {
+        tone = line.startsWith('+') ? 'diff-add' : '';
+        if (number !== null) label = String(number++);
+      }
+    } else {
+      label = String(number++);
+    }
+    const row = element('span', `code-line ${tone}`);
+    const gutter = element('span', 'line-number', label);
+    gutter.setAttribute('aria-hidden', 'true');
+    row.append(gutter, element('span', '', line), document.createTextNode('\n'));
+    body.append(row);
+  }
+  if (lines.length > 3000) body.append(element('span', 'code-line diff-info', 'Показаны первые 3 000 строк.'));
+}
+
+async function openPreview(path, mode) {
+  if (!state.activeChat) return;
+  const id = ++previewRequest;
+  showInspector(true);
+  selectTab(mode);
+  preview = { path, mode, loading: true };
+  renderPreview();
+  renderWorkspace();
+  try {
+    const text = await (mode === 'changes' ? api.readDiff : api.readFile)(state.activeChat, path);
+    if (id !== previewRequest) return;
+    preview = { path, mode, text };
+  } catch (error) {
+    if (id !== previewRequest) return;
+    preview = { path, mode, error: errorText(error) };
+  }
+  renderPreview();
+}
+
+function closePreview() {
+  previewRequest++;
+  preview = undefined;
+  renderPreview();
+  renderWorkspace();
 }
 
 function renderWorkspace() {
@@ -237,14 +434,20 @@ function renderWorkspace() {
   const rows = tab === 'files' ? workspace.files : workspace.changes;
   if (!rows.length) root.append(element('p', '', tab === 'files' ? 'Папка пуста.' : 'Изменений в Git нет.'));
   for (const item of rows) {
-    const button = element('button', 'file', item.name ?? item);
-    button.title = item.name ?? item;
-    button.addEventListener('click', async () => {
-      try {
-        if (tab === 'files') showPreview(item, await api.readFile(state.activeChat, item));
-        else showPreview(item.name, item.diff, true);
-      } catch (error) { toast(error); }
-    });
+    const path = item.path ?? item;
+    const button = element('button', 'file');
+    button.title = path;
+    button.setAttribute('aria-current', String(preview?.path === path && preview.mode === tab));
+    if (item.status) {
+      const [icon, title] = ({ A: ['+', 'Добавлен'], '?': ['+', 'Новый'], D: ['−', 'Удалён'] })[item.status]
+        ?? ['~', 'Изменён'];
+      const badge = element('span', `file-status status-${item.status === 'D' ? 'deleted' : item.status === 'M' ? 'modified' : 'added'}`, icon);
+      badge.title = title;
+      badge.setAttribute('aria-label', title);
+      button.append(badge);
+    }
+    button.append(element('span', 'file-path', path));
+    button.addEventListener('click', () => openPreview(path, tab));
     root.append(button);
   }
 }
@@ -259,6 +462,8 @@ async function refreshWorkspace() {
   if (request !== workspaceRequest) return;
   workspace = result;
   renderWorkspace();
+  renderThread(false);
+  if (preview) openPreview(preview.path, preview.mode);
 }
 
 api.onState(updateState);
@@ -360,8 +565,18 @@ $('composer').addEventListener('submit', async event => {
   }
 });
 $('stop').addEventListener('click', () => api.stop().catch(toast));
-$('allow').addEventListener('click', () => api.permission(true).catch(toast));
-$('deny').addEventListener('click', () => api.permission(false).catch(toast));
+async function decidePermission(allow) {
+  const id = permissionId;
+  if (!id) return;
+  $('allow').disabled = $('deny').disabled = true;
+  try { await api.permission(id, allow); }
+  catch (error) {
+    if (permissionId === id) $('allow').disabled = $('deny').disabled = false;
+    toast(error);
+  }
+}
+$('allow').addEventListener('click', () => decidePermission(true));
+$('deny').addEventListener('click', () => decidePermission(false));
 $('reveal').addEventListener('click', async () => {
   try {
     const error = await api.revealProject(state.activeChat);
@@ -369,14 +584,13 @@ $('reveal').addEventListener('click', async () => {
   } catch (error) { toast(error); }
 });
 $('toggle-inspector').addEventListener('click', () => {
-  $('inspector').hidden = !$('inspector').hidden;
-  $('toggle-inspector').setAttribute('aria-expanded', String(!$('inspector').hidden));
+  showInspector($('inspector').hidden);
 });
+$('close-preview').addEventListener('click', closePreview);
 for (const name of ['files', 'changes']) {
   $(`${name}-tab`).addEventListener('click', () => {
-    tab = name;
-    $('files-tab').setAttribute('aria-selected', String(tab === 'files'));
-    $('changes-tab').setAttribute('aria-selected', String(tab === 'changes'));
+    if (tab !== name) closePreview();
+    selectTab(name);
     refreshWorkspace();
   });
 }

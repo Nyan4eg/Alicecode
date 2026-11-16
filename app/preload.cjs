@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('alicecode', {
   revealProject: invoke('project:reveal'),
   inspectProject: invoke('project:inspect'),
   readFile: invoke('project:read'),
+  readDiff: invoke('project:diff'),
   newChat: invoke('chat:new'),
   selectChat: invoke('chat:select'),
   send: invoke('chat:send'),

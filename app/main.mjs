@@ -2,13 +2,13 @@ import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electro
 import { basename, join, resolve } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { stripVTControlCharacters } from 'node:util';
 import { Store } from './store.mjs';
 import { AcpClient, startRuntime } from './acp.mjs';
 import { alias } from './adapter.mjs';
 import { readPrototypeCredentials, validateCredentials } from './credentials.mjs';
-import { createProject, listChanges, listFiles, readProjectFile } from './workspace.mjs';
+import { createProject, listChanges, listFiles, readProjectDiff, readProjectFile } from './workspace.mjs';
 import { createUpdates } from './updates.mjs';
+import { describePermission, mergeToolUpdate } from './activity.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const cancelledPermission = () => ({ outcome: { outcome: 'cancelled' } });
@@ -27,7 +27,7 @@ const updates = createUpdates(state => emit('app:update', state));
 function snapshot() {
   return {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
-    busy: active?.chatId ?? null, permission: active?.permission?.details ?? null,
+    busy: active?.chatId ?? null, permission: active?.permissions[0]?.details ?? null,
     updates: updates.snapshot(),
     projectRoot: store.setting('projectRoot') ?? join(app.getPath('documents'), 'Alicecode Projects'),
   };
@@ -62,28 +62,16 @@ async function importCredentials() {
   }
 }
 
-function summarizeOutput(content) {
-  if (!Array.isArray(content)) return '';
-  return content.map(item => {
-    if (item.type === 'content' && item.content?.type === 'text') return stripVTControlCharacters(item.content.text);
-    if (item.type === 'diff') return `Изменён файл ${item.path}`;
-    return '';
-  }).filter(Boolean).join('\n').slice(0, 16_000);
-}
-
 function updateTurn(turn, { sessionId, update }) {
   if (turn.sessionId !== sessionId || turn.stop) return;
   if (update.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
     turn.message.text += update.content.text;
   } else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-    const prior = turn.tools.get(update.toolCallId) ?? { id: update.toolCallId };
-    turn.tools.set(update.toolCallId, {
-      ...prior,
-      title: update.title ?? prior.title ?? 'Инструмент',
-      kind: update.kind ?? prior.kind,
-      status: update.status ?? prior.status,
-      output: update.content ? summarizeOutput(update.content) || prior.output : prior.output,
-    });
+    const prior = turn.tools.get(update.toolCallId) ?? {};
+    turn.tools.set(update.toolCallId, mergeToolUpdate(prior, update, turn.cwd));
+    if (update.status === 'completed' && typeof update.rawOutput?.current_dir === 'string') {
+      turn.shellCwd = update.rawOutput.current_dir;
+    }
   } else {
     return;
   }
@@ -104,26 +92,32 @@ function requestPermission(turn, params) {
   if (turn.stop || active !== turn) return cancelledPermission();
   const permit = params.options.find(option => option.kind === 'allow_once');
   if (!permit) return cancelledPermission();
+  const reject = params.options.find(option => option.kind === 'reject_once');
   return new Promise(resolvePermission => {
     const details = {
+      id: params.toolCall.toolCallId,
       chatId: turn.chatId,
-      title: params.toolCall.title ?? 'Вызов инструмента',
-      input: typeof params.toolCall.rawInput === 'object'
-        ? JSON.stringify(params.toolCall.rawInput, null, 2).slice(0, 4_000)
-        : String(params.toolCall.rawInput ?? '').slice(0, 4_000),
+      ...describePermission(params.toolCall, turn.cwd, turn.shellCwd),
     };
-    if (turn.permission) return resolvePermission(cancelledPermission());
-    turn.permission = { details, permit: permit.optionId, resolvePermission };
+    turn.permissions.push({ details, permit: permit.optionId, reject: reject?.optionId, resolvePermission });
     emit('app:state', snapshot());
   });
 }
 
-function resolvePermission(allow) {
-  const p = active?.permission;
-  if (!p) return;
-  active.permission = null;
-  p.resolvePermission(allow ? { outcome: { outcome: 'selected', optionId: p.permit } } : cancelledPermission());
+function resolvePermission(id, allow) {
+  const p = active?.permissions[0];
+  if (!p || p.details.id !== id) return;
+  active.permissions.shift();
+  const tool = active.tools.get(id) ?? { id, title: p.details.title };
+  active.tools.set(id, { ...tool, decision: allow ? 'allowed' : 'denied' });
+  publishTurn(active);
+  const optionId = allow ? p.permit : p.reject;
+  p.resolvePermission(optionId ? { outcome: { outcome: 'selected', optionId } } : cancelledPermission());
   emit('app:state', snapshot());
+}
+
+function cancelPermissions(turn) {
+  for (const pending of turn.permissions.splice(0)) pending.resolvePermission(cancelledPermission());
 }
 
 async function send(chatId, input) {
@@ -133,7 +127,7 @@ async function send(chatId, input) {
   if (!text || text.length > 40_000) throw new Error('Введите сообщение до 40 000 символов.');
   const chat = store.select(chatId);
   const message = { id: store.beginTurn(chatId, text), chatId, role: 'assistant', text: '', tools: [], status: 'running' };
-  const turn = { chatId, message, tools: new Map(), sessionId: null };
+  const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null };
   active = turn;
   emit('app:state', snapshot());
 
@@ -174,7 +168,7 @@ async function send(chatId, input) {
   } finally {
     clearTimeout(turn.refresh);
     clearTimeout(turn.stopTimer);
-    resolvePermission(false);
+    cancelPermissions(turn);
     turn.client?.close();
     message.status = turn.stop ? 'cancelled' : message.error ? 'error' : 'done';
     publishTurn(turn);
@@ -187,7 +181,8 @@ function stop() {
   if (!active || active.stop) return;
   const turn = active;
   turn.stop = true;
-  resolvePermission(false);
+  cancelPermissions(turn);
+  emit('app:state', snapshot());
   if (turn.sessionId) turn.client.notify('session/cancel', { sessionId: turn.sessionId });
   turn.stopTimer = setTimeout(() => turn.client?.close(), 1800);
 }
@@ -255,11 +250,12 @@ if (!app.requestSingleInstanceLock()) {
       return { files, changes };
     });
     bind('project:read', (chatId, path) => readProjectFile(selectedPath(chatId), path));
+    bind('project:diff', (chatId, path) => readProjectDiff(selectedPath(chatId), path));
     bind('chat:new', projectId => { store.addChat(projectId); return snapshot(); });
     bind('chat:select', chatId => { store.select(chatId); return snapshot(); });
     bind('chat:send', send);
     bind('chat:stop', stop);
-    bind('chat:permission', allow => resolvePermission(allow === true));
+    bind('chat:permission', (id, allow) => resolvePermission(id, allow === true));
     bind('updates:check', async () => { await updates.check(); return updates.snapshot(); });
     bind('updates:install', () => {
       if (active) throw new Error('Завершите текущую задачу перед обновлением.');
@@ -284,7 +280,7 @@ app.on('before-quit', () => {
     active.stop = true;
     clearTimeout(active.refresh);
     clearTimeout(active.stopTimer);
-    resolvePermission(false);
+    cancelPermissions(active);
     active.client?.close();
     active.message.status = 'cancelled';
     publishTurn(active);
