@@ -37,10 +37,13 @@ export class Store {
         status TEXT NOT NULL, error TEXT
       );
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS run_reviews (
+        messageId INTEGER PRIMARY KEY REFERENCES messages(id), summary TEXT NOT NULL, files TEXT NOT NULL
+      );
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
     this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT' });
-    this.addColumns('messages', { modelId: 'TEXT' });
+    this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'" });
     this.db.prepare('UPDATE chats SET modelId=? WHERE modelId IS NULL').run(legacyModel.id);
     this.db.function('search_fold', { deterministic: true }, fold);
   }
@@ -146,14 +149,14 @@ export class Store {
     this.db.prepare('UPDATE chats SET sessionId=? WHERE id=?').run(sessionId, chatId);
   }
 
-  beginTurn(chatId, text, modelId = null) {
+  beginTurn(chatId, text, modelId = null, attachments = []) {
     this.db.exec('BEGIN');
     try {
       this.db.prepare(`UPDATE chats SET updatedAt=?,
         title=CASE WHEN renamed=0 AND NOT EXISTS (SELECT 1 FROM messages WHERE chatId=chats.id)
         THEN ? ELSE title END WHERE id=?`).run(Date.now(), text.replace(/\s+/g, ' ').slice(0, 60), chatId);
-      this.db.prepare("INSERT INTO messages (chatId,role,text,status) VALUES (?,'user',?,'done')")
-        .run(chatId, text);
+      this.db.prepare("INSERT INTO messages (chatId,role,text,status,attachments) VALUES (?,'user',?,'done',?)")
+        .run(chatId, text, JSON.stringify(attachments));
       const message = this.db.prepare("INSERT INTO messages (chatId,role,text,status,modelId) VALUES (?,'assistant','','running',?)")
         .run(chatId, modelId);
       this.db.exec('COMMIT');
@@ -162,6 +165,33 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  beginReplay(chatId, tool) {
+    const result = this.db.prepare("INSERT INTO messages (chatId,role,text,tools,status) VALUES (?,'assistant','',?,'running')")
+      .run(chatId, JSON.stringify([tool]));
+    return Number(result.lastInsertRowid);
+  }
+
+  messageTool(chatId, messageId, toolId) {
+    const row = this.db.prepare("SELECT tools FROM messages WHERE id=? AND chatId=? AND status IN ('done','error','cancelled')")
+      .get(messageId, chatId);
+    return row ? JSON.parse(row.tools).find(tool => tool.id === toolId) : undefined;
+  }
+
+  saveReview(id, { files, ...summary }) {
+    const review = { ...summary, files: files.map(({ patch, ...file }) => file) };
+    this.db.prepare('INSERT INTO run_reviews (messageId,summary,files) VALUES (?,?,?)')
+      .run(id, JSON.stringify(review), JSON.stringify(files));
+    return review;
+  }
+
+  reviewFile(chatId, messageId, path) {
+    const row = this.db.prepare(`SELECT run_reviews.files FROM run_reviews JOIN messages ON messages.id=messageId
+      WHERE messageId=? AND chatId=?`).get(messageId, chatId);
+    const file = row && JSON.parse(row.files).find(item => item.path === path);
+    if (!file) throw new Error('Изменение за запуск не найдено.');
+    return file;
   }
 
   saveTurn(id, { text, tools, status, error }) {
@@ -173,8 +203,10 @@ export class Store {
     const activeChat = this.setting('activeChat') ?? null;
     const projects = this.db.prepare('SELECT * FROM projects ORDER BY rowid DESC').all();
     const chats = this.db.prepare('SELECT * FROM chats ORDER BY updatedAt DESC, rowid DESC').all();
-    const messages = activeChat ? this.db.prepare('SELECT * FROM messages WHERE chatId=? ORDER BY id')
-      .all(activeChat).map(message => ({ ...message, tools: JSON.parse(message.tools) })) : [];
+    const messages = activeChat ? this.db.prepare(`SELECT messages.*, run_reviews.summary FROM messages
+      LEFT JOIN run_reviews ON messageId=messages.id WHERE chatId=? ORDER BY messages.id`).all(activeChat)
+      .map(({ summary, ...message }) => ({ ...message, tools: JSON.parse(message.tools),
+        attachments: JSON.parse(message.attachments), review: summary ? JSON.parse(summary) : null })) : [];
     return { activeChat, projects, chats, messages };
   }
 }

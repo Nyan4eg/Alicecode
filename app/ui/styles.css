@@ -181,6 +181,39 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 .toast { position: fixed; bottom: 17px; right: 22px; max-width: 360px; padding: 11px 15px; border-radius: 8px; background: #8b263a; color: white; box-shadow: 0 8px 27px #54223c30; z-index: 2; }
 .diff-add { color: #12613c; background: #e9f5ec; }
 .diff-remove { color: #a22940; background: #f9e9ed; }
+.chat-task { display: block; margin-top: 2px; color: #6748ad; font-size: 10px; font-weight: 650; }
+.chat-task.waiting { color: #80551b; }
+.jump-chat { color: var(--accent-dark); text-align: left; max-width: 100%; overflow-wrap: anywhere; }
+.test-duration, .work-note { color: var(--muted); font-size: 12px; }
+.work-note { margin: 7px 0 3px; }
+.review-button { color: var(--accent-dark); margin: 4px 0; font-size: 12px; }
+.tool-command { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px 6px; }
+.tool-directory { min-width: 0; overflow-wrap: anywhere; font: 11px var(--code); color: var(--muted); }
+.tool-command button { flex: none; color: var(--accent-dark); font-size: 12px; }
+.explorer-actions { display: flex; gap: 2px; align-items: center; }
+#find-file { color: var(--accent-dark); padding: 4px 6px; font-size: 12px; }
+.tabs { flex-wrap: wrap; }
+.change-heading { margin: 9px 7px 3px; color: var(--muted); font-size: 11px; font-weight: 650; }
+.change-heading:first-child { margin-top: 3px; }
+.file-children { padding-left: 13px; border-left: 1px solid var(--line); margin-left: 10px; }
+.folder-item:not(:has(.file-status))::before { content: none; }
+.folder-chevron { color: var(--accent-dark); flex: 0 0 9px; font-size: 11px; }
+.line-target { background: #ede1fb; outline: 1px solid #d0b9ed; outline-offset: -1px; }
+.context-button { color: var(--accent-dark); white-space: nowrap; font-size: 12px; }
+.attachments, .message-context { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+.attachments { max-height: 85px; overflow: auto; padding: 0 9px 6px; }
+.message-context { margin-top: 6px; }
+.attachment { display: flex; max-width: 100%; background: var(--soft); border-radius: 6px; }
+.attachment button { min-width: 0; padding: 3px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px var(--code); }
+.attachment .remove-attachment { flex: none; font: inherit; }
+.context-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; font: 12px var(--code); }
+.line-fields { display: flex; gap: 8px; }
+.line-fields input { margin-top: 4px; }
+.context-text { padding: 8px 9px; margin: 4px 0; max-height: min(38vh, 330px); overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; font: 12px/1.55 var(--code); background: #f8f5fc; border: 1px solid var(--line); border-radius: 8px; }
+.replay-directory { overflow-wrap: anywhere; font-family: var(--code); }
+#context-status { margin: 8px 0 4px; }
+.preview-heading > div { flex: 1; }
 @media (max-width: 1000px) {
   .topbar { padding: 0 15px; }
   .composer-area { padding-right: 14px; padding-left: 14px; }

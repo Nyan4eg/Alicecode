@@ -6,11 +6,16 @@ const statusLabels = {
   pending: 'Ожидает', in_progress: 'Выполняется', completed: 'Готово', failed: 'Ошибка',
 };
 const drafts = new Map();
+const draftContexts = new Map();
 const openTools = new Set();
+const expandedFolders = new Set();
+const folderLimits = new Map();
+const folders = new Map();
 let state;
 let workspace;
 let workspaceRequest = 0;
 let tab = 'files';
+let review;
 let preview;
 let previewRequest = 0;
 let permissionId;
@@ -23,6 +28,11 @@ let searchRequest = 0;
 let searchResults = [];
 let selectedResult = -1;
 let searchHit = null;
+let filePicker;
+let fileTimer;
+let contextTimer;
+let replayTarget;
+let sending = false;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -80,6 +90,11 @@ function renderNavigation() {
       const item = element('button', 'chat-item', chat.title);
       item.title = chat.title;
       item.setAttribute('aria-current', String(chat.id === state.activeChat));
+      if (state.busy === chat.id) {
+        const waiting = state.permission?.chatId === chat.id;
+        const badge = element('span', `chat-task ${waiting ? 'waiting' : ''}`, waiting ? 'Разрешение' : 'В работе');
+        item.append(badge);
+      }
       item.addEventListener('click', () => select(chat.id));
       const chatRow = element('div', 'nav-row chat-row');
       chatRow.append(item, renameButton('chat', chat));
@@ -90,29 +105,35 @@ function renderNavigation() {
 }
 
 function findReference(value, paths) {
-  let normalized = value;
+  if (!value) return;
+  let normalized = value.trim();
   try { normalized = decodeURIComponent(value); } catch {}
+  const suffix = /(?::(\d+)(?::\d+)?|#L(\d+)(?:-L\d+)?)$/i.exec(normalized);
+  const line = suffix ? Number(suffix[1] ?? suffix[2]) : null;
+  if (suffix) normalized = normalized.slice(0, suffix.index);
+  if (/^[a-z]+:\/\//i.test(normalized) && !normalized.startsWith('file:///')) return;
   normalized = normalized.replaceAll('\\', '/').replace(/^file:\/\/\//i, '')
-    .replace(/^\/(?=[a-z]:\/)/i, '').replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '');
+    .replace(/^\/(?=[a-z]:\/)/i, '').replace(/^\.\//, '');
   const project = state.projects.find(item => item.id === activeChat()?.projectId);
   const root = project && project.path.replaceAll('\\', '/').replace(/\/$/, '') + '/';
   if (root && normalized.toLowerCase().startsWith(root.toLowerCase())) normalized = normalized.slice(root.length);
   const direct = paths.find(path => path.toLowerCase() === normalized.toLowerCase());
-  if (direct || normalized.includes('/') || normalized.includes(':')) return direct;
+  if (direct) return { path: direct, line };
+  if (normalized.startsWith('/') || normalized.includes(':') || normalized.split('/').includes('..')) return;
   const matches = paths.filter(path => path.toLowerCase().split('/').at(-1) === normalized.toLowerCase());
-  return matches.length === 1 ? matches[0] : undefined;
+  if (matches.length === 1) return { path: matches[0], line };
+  if ((line || value.includes('/')) && /(?:^|\/)[^/]+\.[a-z0-9_-]{1,16}$/i.test(normalized)) return { path: normalized, line };
 }
 
-function fileLink(path, label = path, preferDiff = false) {
+function fileLink(path, label = path, options = {}) {
   const button = element('button', 'file-link', label);
   button.type = 'button';
   button.title = path;
-  button.addEventListener('click', () => openPreview(path, preferDiff || workspace?.changes.some(change => change.path === path)
-    ? 'changes' : 'files'));
+  button.addEventListener('click', () => openPreview(path, options.mode ?? 'files', options));
   return button;
 }
 
-function formatMessage(text, paths = [], changed = []) {
+function formatMessage(text, paths = []) {
   const container = element('div', 'message-text');
   const parts = text.split(/(?:^|\n)```[^\n]*\n|\n```(?=\n|$)/);
   for (const [i, part] of parts.entries()) {
@@ -121,12 +142,12 @@ function formatMessage(text, paths = [], changed = []) {
       continue;
     }
     let end = 0;
-    const tokens = /\[([^\]\n]+)\]\(([^\n)]+)\)|`([^`\n]+)`|(?<![\p{L}\p{N}_.])([\p{L}\p{N}_./\\-]+\.[\p{L}\p{N}_-]{1,15})(?=[\s,.:;!?()[\]]|$)/gu;
+    const tokens = /\[([^\]\n]+)\]\(([^\n)]+)\)|`([^`\n]+)`|(?<![\p{L}\p{N}_.])([\p{L}\p{N}_./\\-]+\.[\p{L}\p{N}_-]{1,15}(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)?)(?=[\s,.:;!?()[\]]|$)/gu;
     for (const match of part.matchAll(tokens)) {
       const [, label, target, code, bare] = match;
       container.append(document.createTextNode(part.slice(end, match.index)));
       const reference = findReference(target ?? code ?? bare, paths) ?? (label && findReference(label, paths));
-      if (reference) container.append(fileLink(reference, label ?? code ?? bare, changed.includes(reference)));
+      if (reference) container.append(fileLink(reference.path, label ?? code ?? bare, reference));
       else if (code) container.append(element('code', '', code));
       else container.append(document.createTextNode(label ?? bare));
       end = match.index + match[0].length;
@@ -139,6 +160,7 @@ function formatMessage(text, paths = [], changed = []) {
 function actionOutcome(tool) {
   if (tool.decision === 'denied') return ['Отклонено', 'failed'];
   if (tool.interrupted) return ['Прервано', 'failed'];
+  if (tool.local && tool.status === 'in_progress' && state.busyStage === 'prepare') return ['Подготовка', 'neutral'];
   if (tool.background) return ['В фоне', 'neutral'];
   if (tool.status === 'completed' || tool.status === 'failed') {
     if (Number.isInteger(tool.exitCode)) {
@@ -159,7 +181,8 @@ function workSummary(message, paths) {
   const tools = message.tools.map(tool => message.status === 'cancelled' && ['pending', 'in_progress'].includes(tool.status)
     ? { ...tool, interrupted: true } : tool);
   const commands = tools.filter(executedCommand);
-  const testRuns = commands.filter(tool => tool.tests || /\b(?:node\s+--test|npm\s+(?:run\s+)?test|pytest|vitest|jest|cargo\s+test|go\s+test)\b/.test(executedCommand(tool)));
+  const testRuns = commands.filter(tool => tool.local || tool.tests || tool.repeatable
+    || /\b(?:node\s+--test|npm\s+(?:run\s+)?test|pytest|vitest|jest|cargo\s+test|go\s+test)\b/.test(executedCommand(tool)));
   const head = element('div', 'work-heading');
   head.append(element('strong', '', 'Ход работы'));
   head.append(element('span', 'work-meta',
@@ -175,6 +198,8 @@ function workSummary(message, paths) {
         row.append(element('span', 'test-counts', `Прошло ${tool.tests.passed} из ${tool.tests.total}`
           + (tool.tests.failed ? ` · ошибок ${tool.tests.failed}` : '')));
       }
+      if (Number.isFinite(tool.elapsedMs)) row.append(element('span', 'test-duration',
+        `${(tool.elapsedMs / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} с`));
       row.append(element('span', `outcome ${tone}`, label));
       runs.append(row);
     }
@@ -182,15 +207,46 @@ function workSummary(message, paths) {
   }
   if (paths.length) {
     const files = element('div', 'work-files');
-    for (const path of paths) files.append(fileLink(path, path, true));
+    for (const path of paths) {
+      if (message.review?.files.some(item => item.path === path)) {
+        const link = element('button', 'file-link', path);
+        link.type = 'button';
+        link.addEventListener('click', () => openReview(message, path));
+        files.append(link);
+      } else files.append(fileLink(path, path, { mode: 'changes' }));
+    }
     panel.append(files);
   }
+  if (message.review) {
+    const { files, note, skipped } = message.review;
+    if (files.length) {
+      const show = element('button', 'quiet review-button', `Изменения за запуск · ${files.length}`);
+      show.type = 'button';
+      show.addEventListener('click', () => openReview(message));
+      panel.append(show);
+    } else if (message.review.state === 'ready') panel.append(element('p', 'work-note', 'Файлы за запуск не изменились.'));
+    if (note) panel.append(element('p', 'work-note', note));
+    if (skipped) panel.append(element('p', 'work-note', `Не удалось показать изменения для ${skipped} файлов.`));
+  }
+  if (!tools.length) return panel;
   const journal = disclosure(`${message.id}:journal`, `Журнал действий · ${tools.length}`);
   const list = element('div', 'tool-list');
   for (const tool of tools) {
     const details = disclosure(`${message.id}:${tool.id}`, executedCommand(tool) ?? tool.title);
     const [label, tone] = actionOutcome(tool);
     details.querySelector('summary').append(element('span', `outcome ${tone}`, label));
+    if (tool.cwd || tool.repeatable) {
+      const footer = element('div', 'tool-command');
+      if (tool.cwd) footer.append(element('span', 'tool-directory', tool.cwd));
+      if (tool.repeatable && message.status !== 'running') {
+        const repeat = element('button', 'quiet', 'Повторить');
+        repeat.type = 'button';
+        repeat.disabled = Boolean(state.busy);
+        repeat.addEventListener('click', () => confirmReplay(message, tool));
+        footer.append(repeat);
+      }
+      details.append(footer);
+    }
     if (tool.output) details.append(element('pre', 'tool-output', tool.output));
     list.append(details);
   }
@@ -217,23 +273,34 @@ function renderMessage(message) {
   if (message.role === 'user') {
     row.setAttribute('aria-label', 'Вы');
     row.append(formatMessage(message.text));
+    if (message.attachments?.length) {
+      const context = element('div', 'message-context');
+      for (const item of message.attachments) context.append(fileLink(item.path, contextLabel(item), { line: item.start }));
+      row.append(context);
+    }
     return row;
   }
   const role = element('div', 'message-role');
   const mark = element('span', 'mark');
   mark.setAttribute('aria-hidden', 'true');
-  role.append(mark, document.createTextNode('Алиса'));
+  const local = message.tools.some(tool => tool.local);
+  if (!local) role.append(mark);
+  role.append(document.createTextNode(local ? 'Локальный запуск тестов' : 'Алиса'));
   if (message.modelId) role.append(element('span', 'model-label',
     state.models.find(model => model.id === message.modelId)?.label ?? message.modelId));
   row.append(role);
   const paths = [...new Set(message.tools.filter(tool => tool.status === 'completed' && tool.decision !== 'denied')
     .flatMap(tool => tool.paths ?? []))];
-  const references = [...new Set([...paths, ...(workspace?.files ?? []), ...(workspace?.changes ?? []).map(item => item.path)])];
-  if (message.tools.length) row.append(workSummary(message, paths));
-  row.append(formatMessage(message.text, references, paths));
+  const visibleFiles = [...folders.values()].flatMap(folder => (folder.entries ?? []).filter(item => !item.directory).map(item => item.path));
+  const references = [...new Set([...paths, ...visibleFiles, ...(workspace?.changes ?? []).map(item => item.path)])];
+  if (message.tools.length || message.review) row.append(workSummary(message, paths));
+  row.append(formatMessage(message.text, references));
   if (message.error) row.append(element('p', 'error', message.error));
   if (message.status === 'cancelled') row.append(element('p', 'busy-text', 'Задача остановлена.'));
-  if (message.status === 'running' && !message.text) row.append(element('p', 'busy-text', 'Алиса работает…'));
+  if (message.status === 'running' && !message.text) {
+    const status = { prepare: 'Проверяем рабочую папку…', review: 'Сравниваем изменения…', test: 'Выполняем тесты…' };
+    row.append(element('p', 'busy-text', status[state.busyStage] ?? 'Алиса работает…'));
+  }
   return row;
 }
 
@@ -260,17 +327,28 @@ function renderThread(forceScroll) {
 function renderComposer() {
   const chat = activeChat();
   $('composer-area').hidden = !chat;
-  $('stop').hidden = state.busy !== chat?.id;
+  $('stop').hidden = state.busy !== chat?.id || state.busyStage === 'review';
   const permission = state.permission;
   $('permission').hidden = !permission || permission.chatId !== chat?.id;
   renderPermission($('permission').hidden ? null : permission);
   const available = state.models.some(model => model.id === (chat?.modelId ?? state.defaultModel));
   const notice = !state.configured ? state.credentialError ?? 'Подключите ключ Yandex AI Studio в настройках.'
     : chat && !available ? 'Модель отсутствует в каталоге. Выберите другую.'
-    : state.busy && state.busy !== chat?.id ? 'Алиса работает в другом чате.' : '';
-  setText('notice', notice).hidden = !notice;
+    : '';
+  const other = state.chats.find(item => item.id === state.busy && item.id !== chat?.id);
+  const noticeNode = setText('notice', notice);
+  if (other) {
+    const waiting = state.permission?.chatId === other.id;
+    const jump = element('button', 'quiet jump-chat', `${waiting ? 'Ждёт разрешения' : 'В работе'} · ${other.title}`);
+    jump.type = 'button';
+    jump.addEventListener('click', () => select(other.id));
+    noticeNode.append(jump);
+  }
+  noticeNode.hidden = !notice && !other;
   $('prompt').disabled = !state.configured;
-  $('send').disabled = !chat || !state.configured || !available || Boolean(state.busy) || !$('prompt').value.trim();
+  $('attach-file').disabled = !chat || !state.configured || currentContext().length >= 6;
+  $('send').disabled = !chat || !state.configured || !available || Boolean(state.busy) || sending || !$('prompt').value.trim();
+  renderAttachments();
 }
 
 function renderModels() {
@@ -370,6 +448,15 @@ function updateState(next) {
   if (changed) {
     $('prompt').value = drafts.get(state.activeChat) ?? '';
     workspace = undefined;
+    folders.clear();
+    const priorProject = previous?.chats.find(item => item.id === previous.activeChat)?.projectId;
+    if (priorProject !== activeChat()?.projectId) {
+      expandedFolders.clear();
+      folderLimits.clear();
+    }
+    review = undefined;
+    if (tab === 'review') selectTab('files');
+    else selectTab(tab);
     preview = undefined;
     previewRequest++;
     searchHit = null;
@@ -381,6 +468,7 @@ function updateState(next) {
   setText('chat-title', chat?.title ?? '').title = chat?.title ?? '';
   $('new-chat').hidden = !chat;
   $('reveal').disabled = !chat;
+  $('find-file').disabled = !chat;
   renderModels();
   renderNavigation();
   renderComposer();
@@ -486,8 +574,8 @@ async function openSearchResult(result) {
 
 function selectTab(next) {
   tab = next;
-  $('files-tab').setAttribute('aria-selected', String(tab === 'files'));
-  $('changes-tab').setAttribute('aria-selected', String(tab === 'changes'));
+  $('review-tab').hidden = !review;
+  for (const name of ['files', 'changes', 'review']) $(`${name}-tab`).setAttribute('aria-selected', String(tab === name));
 }
 
 function showInspector(visible, persist = true) {
@@ -577,63 +665,107 @@ function renderPreview() {
   renderLayout();
   if (!preview) return;
   setText('preview-title', preview.path).title = preview.path;
-  setText('preview-mode', preview.mode === 'changes' ? 'Изменения в Git' : 'Файл');
+  const mode = preview.mode === 'review' ? 'Изменения за запуск' : preview.mode === 'files' ? 'Файл'
+    : { staged: 'В индексе Git', unstaged: 'В рабочей папке Git', all: 'Все изменения Git' }[preview.scope];
+  setText('preview-mode', mode);
+  $('attach-preview').hidden = preview.mode !== 'files' || Boolean(preview.error) || !preview.text || !state.configured;
   const body = $('preview-content');
-  body.setAttribute('aria-label', preview.mode === 'changes' ? 'Изменения файла' : 'Содержимое файла');
+  body.setAttribute('aria-label', preview.mode === 'files' ? 'Содержимое файла' : 'Изменения файла');
   body.replaceChildren();
   if (preview.loading || preview.error || !preview.text) {
-    body.textContent = preview.loading ? 'Загрузка…' : preview.error
-      ?? (preview.mode === 'changes' ? 'Изменений для этого файла нет.' : 'Пустой файл.');
+    body.textContent = preview.loading ? 'Загрузка…' : preview.error ?? preview.note
+      ?? (preview.mode === 'files' ? 'Пустой файл.' : 'Изменений для этого файла нет.');
     return;
   }
 
   const lines = preview.text.replace(/\r?\n$/, '').split(/\r?\n/);
-  let number = preview.mode === 'files' ? 1 : null;
-  for (const line of lines.slice(0, 3000)) {
+  const target = preview.mode === 'files' && Number.isSafeInteger(preview.line) ? preview.line : null;
+  const first = target > 3000 ? Math.min(Math.max(0, target - 100), Math.max(0, lines.length - 3000)) : 0;
+  let number = preview.mode === 'files' ? first + 1 : null;
+  let highlighted;
+  for (const line of lines.slice(first, first + 3000)) {
     let tone = '';
     let label = '';
-    if (preview.mode === 'changes') {
+    if (preview.mode !== 'files') {
       const hunk = /^@@ .+ \+(\d+)(?:,\d+)? @@/.exec(line);
       if (hunk) {
         number = Number(hunk[1]);
         tone = 'diff-info';
-      } else if (line.startsWith('+++ ') || line.startsWith('--- ') || line.startsWith('diff ') || line.startsWith('index ')) {
+      } else if (number === null) {
         tone = 'diff-info';
       } else if (line.startsWith('-')) {
         tone = 'diff-remove';
       } else if (line.startsWith('+') || line.startsWith(' ')) {
         tone = line.startsWith('+') ? 'diff-add' : '';
-        if (number !== null) label = String(number++);
+        label = String(number++);
       }
     } else {
       label = String(number++);
     }
-    const row = element('span', `code-line ${tone}`);
+    const row = element('span', 'code-line ' + tone);
     const gutter = element('span', 'line-number', label);
     gutter.setAttribute('aria-hidden', 'true');
     row.append(gutter, element('span', '', line), document.createTextNode('\n'));
     body.append(row);
+    if (target && Number(label) === target) {
+      highlighted = row;
+      row.classList.add('line-target');
+    }
   }
-  if (lines.length > 3000) body.append(element('span', 'code-line diff-info', 'Показаны первые 3 000 строк.'));
+  if (first || lines.length > 3000) body.append(element('span', 'code-line diff-info',
+    'Строки ' + (first + 1) + '–' + Math.min(first + 3000, lines.length) + ' из ' + lines.length));
+  if (highlighted) body.scrollTop = Math.max(0, highlighted.offsetTop - body.firstChild.offsetTop - body.clientHeight / 3);
+  else if (target > lines.length) body.append(element('span', 'code-line diff-info', 'Строки ' + target + ' в файле нет.'));
 }
 
-async function openPreview(path, mode) {
+async function openPreview(path, mode, { line = null, scope = 'all', messageId = review?.messageId } = {}) {
   if (!state.activeChat) return;
+  const chatId = state.activeChat;
   const id = ++previewRequest;
   if (!layout.inspectorVisible) showInspector(true);
   selectTab(mode);
-  preview = { path, mode, loading: true };
+  preview = { path, mode, line, scope, messageId, loading: true };
   renderPreview();
   renderWorkspace();
+  const body = $('preview-content');
+  body.scrollTop = 0;
+  body.scrollLeft = 0;
   try {
-    const text = await (mode === 'changes' ? api.readDiff : api.readFile)(state.activeChat, path);
-    if (id !== previewRequest) return;
-    preview = { path, mode, text };
+    if (mode === 'review') {
+      const file = await api.readReviewFile(chatId, messageId, path);
+      if (id !== previewRequest) return;
+      const note = file.limited ? 'Фрагмент превышает лимит сохранённого сравнения.'
+        : file.binary ? 'Содержимое двоичного файла изменилось.'
+          : file.status === 'A' ? 'Добавлен пустой файл.' : 'Удалён пустой файл.';
+      preview = { path, mode, line, scope, messageId, text: file.patch, note };
+    } else {
+      let text;
+      if (mode === 'changes') text = await api.readDiff(chatId, path, scope);
+      else {
+        try { text = await api.readFile(chatId, path); }
+        catch (error) {
+          if (path.includes('/')) throw error;
+          const matches = (await api.searchFiles(chatId, path)).filter(item => item.split('/').at(-1).toLowerCase() === path.toLowerCase());
+          if (matches.length !== 1 || matches[0] === path) throw error;
+          path = matches[0];
+          text = await api.readFile(chatId, path);
+        }
+      }
+      if (id !== previewRequest) return;
+      preview = { path, mode, line, scope, text };
+    }
   } catch (error) {
     if (id !== previewRequest) return;
-    preview = { path, mode, error: errorText(error) };
+    preview = { path, mode, line, scope, messageId, error: errorText(error) };
   }
   renderPreview();
+  renderWorkspace();
+}
+
+function openReview(message, path) {
+  if (!message.review?.files.length || message.chatId !== state.activeChat) return;
+  review = { ...message.review, messageId: message.id };
+  openPreview(path ?? review.files[0].path, 'review');
 }
 
 function closePreview() {
@@ -643,53 +775,353 @@ function closePreview() {
   renderWorkspace();
 }
 
+function workspaceFile(item, mode, scope = 'all') {
+  const button = element('button', 'file');
+  button.type = 'button';
+  button.title = item.path;
+  button.setAttribute('aria-current', String(preview?.path === item.path && preview.mode === mode && preview.scope === scope));
+  if (item.status) {
+    const [icon, name, tone] = ({
+      A: ['+', 'Добавлен', 'added'], '?': ['+', 'Новый', 'added'], D: ['−', 'Удалён', 'deleted'],
+      U: ['!', 'Конфликт', 'deleted'],
+    })[item.status] ?? ['~', 'Изменён', 'modified'];
+    const badge = element('span', 'file-status status-' + tone, icon);
+    badge.title = name;
+    badge.setAttribute('aria-label', name);
+    button.append(badge);
+  }
+  button.append(element('span', 'file-path', item.name ?? item.path));
+  button.addEventListener('click', () => openPreview(item.path, mode, { scope }));
+  return button;
+}
+
+function renderDirectory(path) {
+  const group = element('div', path ? 'file-children' : '');
+  const folder = folders.get(path);
+  if (!folder?.entries) {
+    group.append(element('p', '', folder?.error ?? 'Читаем папку…'));
+    return group;
+  }
+  if (!folder.entries.length) group.append(element('p', '', 'Видимых файлов нет.'));
+  const amount = folderLimits.get(path) ?? 180;
+  for (const item of folder.entries.slice(0, amount)) {
+    if (!item.directory) {
+      group.append(workspaceFile(item, 'files'));
+      continue;
+    }
+    const expanded = expandedFolders.has(item.path);
+    const button = element('button', 'file folder-item');
+    button.type = 'button';
+    button.dataset.folder = item.path;
+    button.title = item.path;
+    button.setAttribute('aria-expanded', String(expanded));
+    const chevron = element('span', 'folder-chevron', expanded ? '▾' : '▸');
+    chevron.setAttribute('aria-hidden', 'true');
+    button.append(chevron, element('span', 'file-path', item.name));
+    button.addEventListener('click', () => {
+      if (expandedFolders.delete(item.path)) renderWorkspace();
+      else {
+        expandedFolders.add(item.path);
+        if (!folders.get(item.path)?.entries) void loadFolder(item.path);
+        renderWorkspace();
+      }
+      [...$('workspace').querySelectorAll('.folder-item')].find(node => node.dataset.folder === item.path)?.focus();
+    });
+    group.append(button);
+    if (expanded) group.append(renderDirectory(item.path));
+  }
+  if (folder.entries.length > amount) {
+    const more = element('button', 'quiet', 'Показать ещё');
+    more.type = 'button';
+    more.addEventListener('click', () => {
+      folderLimits.set(path, amount + 180);
+      renderWorkspace();
+    });
+    group.append(more);
+  }
+  return group;
+}
+
 function renderWorkspace() {
   const root = $('workspace');
+  const focusedFolder = document.activeElement?.dataset.folder;
   root.replaceChildren();
   const count = workspace?.changes.length ?? 0;
   setText('changes-count', String(count)).hidden = !count;
-  if (!state.activeChat || !workspace) {
-    root.append(element('p', '', state.activeChat ? 'Загружаем папку…' : 'Выберите проект.'));
+  if (!state.activeChat) {
+    root.append(element('p', '', 'Выберите проект.'));
     return;
   }
-  if (workspace.error) {
-    root.append(element('p', '', workspace.error));
+  if (tab === 'files') {
+    root.append(renderDirectory(''));
+    if (focusedFolder) [...root.querySelectorAll('.folder-item')].find(node => node.dataset.folder === focusedFolder)?.focus();
     return;
   }
-  const rows = tab === 'files' ? workspace.files : workspace.changes;
-  if (!rows.length) root.append(element('p', '', tab === 'files' ? 'Папка пуста.' : 'Изменений в Git нет.'));
-  for (const item of rows) {
-    const path = item.path ?? item;
-    const button = element('button', 'file');
-    button.title = path;
-    button.setAttribute('aria-current', String(preview?.path === path && preview.mode === tab));
-    if (item.status) {
-      const [icon, title] = ({ A: ['+', 'Добавлен'], '?': ['+', 'Новый'], D: ['−', 'Удалён'] })[item.status]
-        ?? ['~', 'Изменён'];
-      const badge = element('span', `file-status status-${item.status === 'D' ? 'deleted' : item.status === 'M' ? 'modified' : 'added'}`, icon);
-      badge.title = title;
-      badge.setAttribute('aria-label', title);
-      button.append(badge);
-    }
-    button.append(element('span', 'file-path', path));
-    button.addEventListener('click', () => openPreview(path, tab));
-    root.append(button);
+  if (tab === 'review' && review) {
+    root.append(element('div', 'change-heading', 'Изменения за запуск'));
+    for (const item of review.files) root.append(workspaceFile(item, 'review'));
+    return;
   }
+  if (!workspace || workspace.error || !count) {
+    root.append(element('p', '', workspace?.error ?? (workspace ? 'Изменений в Git нет.' : 'Читаем состояние Git…')));
+    return;
+  }
+  const sections = [
+    ['В индексе', 'staged', item => item.staged],
+    ['В рабочей папке', 'unstaged', item => item.unstaged],
+    ['Новые файлы', 'all', item => item.untracked ? '?' : null],
+  ];
+  for (const [title, scope, pickStatus] of sections) {
+    const items = workspace.changes.filter(pickStatus);
+    if (!items.length) continue;
+    root.append(element('div', 'change-heading', title));
+    for (const item of items) root.append(workspaceFile({ ...item, status: pickStatus(item) }, 'changes', scope));
+  }
+}
+
+async function loadFolder(path) {
+  const generation = workspaceRequest;
+  const pending = {};
+  folders.set(path, pending);
+  try { pending.entries = await api.listDirectory(state.activeChat, path); }
+  catch (error) { pending.error = errorText(error); }
+  if (generation === workspaceRequest && folders.get(path) === pending) renderWorkspace();
 }
 
 async function refreshWorkspace() {
   const request = ++workspaceRequest;
   renderWorkspace();
   if (!state.activeChat) return;
-  let result;
-  try { result = await api.inspectProject(state.activeChat); }
-  catch (error) { result = { files: [], changes: [], error: errorText(error) }; }
+  const opened = [...expandedFolders].filter(path => path.split('/').slice(0, -1)
+    .every((_, index, parts) => expandedFolders.has(parts.slice(0, index + 1).join('/'))));
+  const read = api.inspectProject(state.activeChat).catch(error => ({ changes: [], error: errorText(error) }));
+  const [result] = await Promise.all([read, loadFolder(''), ...opened.map(path => loadFolder(path))]);
   if (request !== workspaceRequest) return;
   workspace = result;
   renderWorkspace();
   renderThread(false);
-  if (preview) openPreview(preview.path, preview.mode);
+  if (preview && preview.mode !== 'review') openPreview(preview.path, preview.mode, preview);
 }
+
+function contextLabel(item) {
+  const lines = item.start === item.end ? item.start : item.start + '–' + item.end;
+  return item.path + ':' + lines;
+}
+
+function currentContext() {
+  return draftContexts.get(state.activeChat) ?? [];
+}
+
+function renderAttachments() {
+  const root = $('attachments');
+  root.replaceChildren();
+  const items = currentContext();
+  root.hidden = items.length === 0;
+  items.forEach((item, index) => {
+    const chip = element('div', 'attachment');
+    const open = element('button', 'quiet', '@ ' + contextLabel(item));
+    open.type = 'button';
+    open.title = contextLabel(item);
+    open.addEventListener('click', () => openFilePicker('attach', '', null, item, index));
+    const remove = element('button', 'quiet remove-attachment', '×');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', 'Убрать ' + contextLabel(item));
+    remove.addEventListener('click', () => {
+      draftContexts.set(state.activeChat, currentContext().filter((_, slot) => slot !== index));
+      renderComposer();
+      $('prompt').focus();
+    });
+    chip.append(open, remove);
+    root.append(chip);
+  });
+}
+
+function renderFileResults() {
+  const results = $('file-results');
+  results.replaceChildren();
+  filePicker.files.forEach((path, index) => {
+    const button = element('button', 'history-result');
+    button.type = 'button';
+    button.id = 'file-result-' + index;
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(index === filePicker.index));
+    button.append(element('strong', '', path.split('/').at(-1)), element('small', '', path));
+    button.addEventListener('click', () => chooseFile(path));
+    results.append(button);
+  });
+  selectFileResult(filePicker.index);
+}
+
+function selectFileResult(index) {
+  const count = filePicker.files.length;
+  const query = $('file-query');
+  filePicker.index = count ? (index + count) % count : -1;
+  const rows = $('file-results').children;
+  for (const [position, item] of [...rows].entries()) item.setAttribute('aria-selected', String(position === filePicker.index));
+  const selected = rows[filePicker.index];
+  if (selected) {
+    query.setAttribute('aria-activedescendant', selected.id);
+    selected.scrollIntoView({ block: 'nearest' });
+  } else query.removeAttribute('aria-activedescendant');
+}
+
+function updateFileQuery(delay = 120) {
+  const picker = filePicker;
+  clearTimeout(fileTimer);
+  const query = $('file-query').value;
+  const suffix = /:(\d+)(?:-\d+)?$/.exec(query);
+  const needle = suffix ? query.slice(0, suffix.index) : query;
+  picker.line = suffix ? Number(suffix[1]) : null;
+  const version = ++picker.searchVersion;
+  picker.files = [];
+  picker.index = -1;
+  renderFileResults();
+  setText('file-search-status', 'Ищем файлы…');
+  fileTimer = setTimeout(async () => {
+    try {
+      const files = await api.searchFiles(picker.chatId, needle);
+      if (filePicker !== picker || picker.searchVersion !== version) return;
+      picker.files = files;
+      picker.index = files.length ? 0 : -1;
+      renderFileResults();
+      setText('file-search-status', files.length === 40 ? 'Первые 40 совпадений. Уточните имя или путь.'
+        : files.length ? '' : 'Файлы не найдены.');
+    } catch (error) {
+      if (filePicker === picker && picker.searchVersion === version) setText('file-search-status', errorText(error));
+    }
+  }, delay);
+}
+
+function openFilePicker(mode, query = '', mention = null, initial = null, replaceSlot = null) {
+  const chatId = state.activeChat;
+  const dialog = $('file-dialog');
+  if (!chatId || document.querySelector('dialog[open]')) return;
+  filePicker = { mode, chatId, mention, replaceSlot, files: [], index: -1, searchVersion: 0, contextVersion: 0 };
+  $('file-query').value = query;
+  $('context-form').hidden = Boolean(!initial);
+  $('file-search-pane').hidden = Boolean(initial);
+  $('file-results').replaceChildren();
+  setText('file-dialog-title', mode === 'attach' ? 'Добавить контекст' : 'Найти файл');
+  dialog.showModal();
+  if (initial) chooseContextFile(initial.path, initial.start, initial.end);
+  else {
+    $('file-query').focus();
+    updateFileQuery(0);
+  }
+}
+
+function chooseFile(path) {
+  const picker = filePicker;
+  if (!picker || picker.chatId !== state.activeChat) return;
+  if (picker.mode === 'open') {
+    $('file-dialog').close();
+    openPreview(path, 'files', { line: picker.line });
+  } else chooseContextFile(path, picker.line, picker.line);
+}
+
+function chooseContextFile(path, start = null, end = null) {
+  filePicker.path = path;
+  $('file-search-pane').hidden = true;
+  $('context-form').hidden = false;
+  setText('context-path', path).title = path;
+  $('context-start').value = start ?? '';
+  $('context-end').value = end ?? '';
+  $('context-start').focus();
+  updateContextPreview(0);
+}
+
+function updateContextPreview(delay = 160) {
+  const picker = filePicker;
+  clearTimeout(contextTimer);
+  const version = ++picker.contextVersion;
+  picker.item = null;
+  $('confirm-context').disabled = true;
+  $('context-text').hidden = true;
+  $('context-end').placeholder = $('context-start').value ? 'Та же строка' : 'До конца';
+  setText('context-status', 'Читаем фрагмент…');
+  contextTimer = setTimeout(async () => {
+    try {
+      const range = ['context-start', 'context-end'].map(id => $(id).value === '' ? null : $(id).valueAsNumber);
+      const item = await api.previewContext(picker.chatId, picker.path, ...range);
+      if (filePicker !== picker || picker.contextVersion !== version) return;
+      picker.item = item;
+      setText('context-status', 'Фрагмент, который получит модель');
+      setText('context-text', item.content).hidden = false;
+      $('confirm-context').disabled = false;
+    } catch (error) {
+      if (filePicker === picker && picker.contextVersion === version) setText('context-status', errorText(error));
+    }
+  }, delay);
+}
+
+async function confirmReplay(message, tool) {
+  const chatId = state.activeChat;
+  try {
+    const details = await api.replayDetails(chatId, message.id, tool.id);
+    if (state.activeChat !== chatId || state.busy || document.querySelector('dialog[open]')) return;
+    replayTarget = { chatId, messageId: message.id, toolId: tool.id, cwd: details.cwd };
+    setText('replay-command', details.command);
+    setText('replay-directory', details.cwd);
+    $('replay-dialog').showModal();
+  } catch (error) { toast(error); }
+}
+
+$('file-query').addEventListener('input', () => updateFileQuery());
+$('file-query').addEventListener('keydown', event => {
+  if (event.isComposing) return;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    selectFileResult(filePicker.index + (event.key === 'ArrowDown' ? 1 : -1));
+  } else if (event.key === 'Enter' && filePicker.index >= 0) {
+    event.preventDefault();
+    chooseFile(filePicker.files[filePicker.index]);
+  }
+});
+$('file-dialog').addEventListener('close', () => {
+  if ($('file-dialog').open) return;
+  clearTimeout(fileTimer);
+  clearTimeout(contextTimer);
+  filePicker = undefined;
+});
+$('context-back').addEventListener('click', () => {
+  filePicker.contextVersion++;
+  $('context-form').hidden = true;
+  $('file-search-pane').hidden = false;
+  $('file-query').focus();
+  updateFileQuery(0);
+});
+for (const id of ['context-start', 'context-end']) $(id).addEventListener('input', () => updateContextPreview());
+$('context-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const picker = filePicker;
+  if (!picker?.item || picker.chatId !== state.activeChat) return;
+  const { content, ...reference } = picker.item;
+  const items = [...currentContext()];
+  if (picker.replaceSlot != null) items[picker.replaceSlot] = reference;
+  else if (items.length < 6 && !items.some(item => item.digest === reference.digest)) items.push(reference);
+  draftContexts.set(picker.chatId, items);
+  const prompt = $('prompt');
+  const { mention } = picker;
+  if (mention && prompt.value.slice(mention.start, mention.end) === mention.text) {
+    prompt.setRangeText('', mention.start, mention.end, 'end');
+  }
+  $('file-dialog').close();
+  renderComposer();
+  prompt.focus();
+});
+$('find-file').addEventListener('click', () => openFilePicker('open'));
+$('attach-file').addEventListener('click', () => openFilePicker('attach'));
+$('attach-preview').addEventListener('click', () => {
+  if (preview && currentContext().length < 6) openFilePicker('attach', '', null, { path: preview.path, start: preview.line, end: preview.line });
+});
+$('replay-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = replayTarget;
+  $('replay-dialog').close();
+  if (!target || target.chatId !== state.activeChat || state.busy) return;
+  try { await api.replayTest(target.chatId, target.messageId, target.toolId, target.cwd); }
+  catch (error) { toast(error); }
+});
 
 api.onState(updateState);
 api.onUpdate(update => {
@@ -823,7 +1255,17 @@ $('refresh-models').addEventListener('click', () => api.refreshModels().catch(to
 for (const button of document.querySelectorAll('.close-dialog')) {
   button.addEventListener('click', () => button.closest('dialog').close());
 }
-$('prompt').addEventListener('input', renderComposer);
+$('prompt').addEventListener('input', event => {
+  renderComposer();
+  if (event.isComposing || $('attach-file').disabled) return;
+  const prompt = $('prompt');
+  if (prompt.selectionStart !== prompt.selectionEnd || !event.data?.includes('@')) return;
+  const end = prompt.selectionStart;
+  const match = /(?:^|\s)@([^\s@]*)$/.exec(prompt.value.slice(0, end));
+  if (!match) return;
+  const text = '@' + match[1];
+  openFilePicker('attach', match[1], { start: end - text.length, end, text });
+});
 $('prompt').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -835,12 +1277,19 @@ $('composer').addEventListener('submit', async event => {
   const input = $('prompt').value;
   if ($('send').disabled || !state.activeChat || !input.trim()) return;
   const chatId = state.activeChat;
+  const attachments = currentContext();
   $('prompt').value = '';
+  draftContexts.delete(chatId);
+  sending = true;
   renderComposer();
-  try { await api.send(chatId, input); }
+  try { await api.send(chatId, input, attachments); }
   catch (error) {
     if (state.activeChat === chatId && !$('prompt').value) $('prompt').value = input;
+    if (state.activeChat !== chatId && !drafts.get(chatId)) drafts.set(chatId, input);
+    if (attachments.length && !draftContexts.get(chatId)?.length) draftContexts.set(chatId, attachments);
     toast(error);
+  } finally {
+    sending = false;
     renderComposer();
   }
 });
@@ -876,6 +1325,9 @@ document.addEventListener('keydown', event => {
   if (event.ctrlKey && !event.shiftKey && event.code === 'KeyK') {
     event.preventDefault();
     openSearch();
+  } else if (!modal && event.ctrlKey && !event.shiftKey && event.code === 'KeyP' && activeChat()) {
+    event.preventDefault();
+    openFilePicker('open');
   } else if (!modal && event.ctrlKey && !event.shiftKey && event.code === 'KeyN' && activeChat()) {
     event.preventDefault();
     newChat();
@@ -890,11 +1342,13 @@ document.addEventListener('keydown', event => {
   }
 });
 $('close-preview').addEventListener('click', closePreview);
-for (const name of ['files', 'changes']) {
+for (const name of ['files', 'changes', 'review']) {
   $(`${name}-tab`).addEventListener('click', () => {
     if (tab !== name) closePreview();
     selectTab(name);
-    refreshWorkspace();
+    if (name === 'review') {
+      if (!preview && review) openPreview(review.files[0].path, 'review');
+    } else refreshWorkspace();
   });
 }
 api.state().then(updateState).catch(toast);

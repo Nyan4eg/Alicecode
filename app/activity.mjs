@@ -37,6 +37,7 @@ export function mergeToolUpdate(previous, update, root) {
     output: output.length > 16_000 ? output.slice(0, 8_000) + '\n…\n' + output.slice(-8_000) : output,
   };
   if (command) tool.command = command;
+  if (kind === 'execute' && typeof raw?.current_dir === 'string') tool.cwd = raw.current_dir;
   if (editKinds.has(kind)) {
     const candidates = [
       ...(update.locations ?? []).map(item => item.path),

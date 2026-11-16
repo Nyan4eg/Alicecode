@@ -59,8 +59,10 @@
           </section>
           <form id="composer" class="composer">
             <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" placeholder="Опишите задачу для Алисы…"></textarea>
+            <div id="attachments" class="attachments" aria-label="Прикреплённые фрагменты" hidden></div>
             <div class="composer-footer">
-              <span id="compose-hint">Enter — отправить · Shift + Enter — новая строка</span>
+              <button id="attach-file" class="quiet context-button" type="button" title="Добавить файл или строки в контекст">@ Файл</button>
+              <span id="compose-hint">Enter — отправить</span>
               <button id="stop" class="quiet" type="button" hidden>■ Остановить</button>
               <button id="send" class="primary" type="submit" disabled>Отправить <span aria-hidden="true">↑</span></button>
             </div>
@@ -73,11 +75,15 @@
       <aside id="inspector" class="inspector" aria-label="Обозреватель проекта">
         <div class="explorer-heading">
           <strong>Рабочая папка</strong>
-          <button id="reveal" class="quiet icon" type="button" title="Открыть в Проводнике" aria-label="Открыть в Проводнике" disabled>↗</button>
+          <div class="explorer-actions">
+            <button id="find-file" class="quiet" type="button" title="Найти файл · Ctrl+P" aria-keyshortcuts="Control+p" disabled>Найти</button>
+            <button id="reveal" class="quiet icon" type="button" title="Открыть в Проводнике" aria-label="Открыть в Проводнике" disabled>↗</button>
+          </div>
         </div>
         <div class="tabs" role="tablist" aria-label="Содержимое рабочей папки">
           <button id="files-tab" type="button" role="tab" aria-selected="true">Файлы</button>
           <button id="changes-tab" type="button" role="tab" aria-selected="false">Изменения <span id="changes-count" hidden></span></button>
+          <button id="review-tab" type="button" role="tab" aria-selected="false" hidden>Запуск</button>
         </div>
         <div id="workspace" class="workspace"></div>
         <section id="inline-preview" class="inline-preview" aria-labelledby="preview-title" hidden>
@@ -86,6 +92,7 @@
               <div id="preview-mode" class="side-label"></div>
               <h2 id="preview-title"></h2>
             </div>
+            <button id="attach-preview" class="quiet context-button" type="button" title="Добавить файл или строки в контекст" hidden>@</button>
             <button id="close-preview" class="quiet icon" type="button" aria-label="Закрыть просмотр" title="Закрыть просмотр">×</button>
           </div>
           <pre id="preview-content" tabindex="0" aria-label="Содержимое файла"></pre>
@@ -124,6 +131,36 @@
     <div id="history-status" class="muted history-status" role="status">Ищем по всем проектам и чатам.</div>
     <div id="history-results" class="history-results" role="listbox" aria-label="Результаты поиска"></div>
     <div class="history-keys"><kbd>↑</kbd> <kbd>↓</kbd> Выбрать <kbd>Enter</kbd> Открыть <kbd>Esc</kbd> Закрыть</div>
+  </dialog>
+
+  <dialog id="file-dialog" class="history-dialog" aria-labelledby="file-dialog-title">
+    <div class="dialog-header"><h2 id="file-dialog-title"></h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <div id="file-search-pane">
+      <input id="file-query" type="search" aria-label="Имя файла или путь" placeholder="Имя файла или путь" maxlength="240"
+        autocomplete="off" spellcheck="false" aria-controls="file-results" aria-autocomplete="list" aria-expanded="true" role="combobox">
+      <p id="file-search-status" class="muted history-status" role="status"></p>
+      <div id="file-results" class="history-results" role="listbox" aria-label="Найденные файлы"></div>
+      <div class="history-keys"><kbd>↑</kbd> <kbd>↓</kbd> Выбрать <kbd>Enter</kbd> Открыть <kbd>Esc</kbd> Закрыть</div>
+    </div>
+    <form id="context-form" hidden>
+      <div class="context-heading"><button id="context-back" class="quiet" type="button">← Файлы</button><span id="context-path"></span></div>
+      <div class="line-fields">
+        <label for="context-start">Со строки<input id="context-start" type="number" min="1" placeholder="1"></label>
+        <label for="context-end">По строку<input id="context-end" type="number" min="1" placeholder="До конца"></label>
+      </div>
+      <p id="context-status" class="muted" role="status"></p>
+      <pre id="context-text" class="context-text" tabindex="0" aria-label="Фрагмент, который получит модель" hidden></pre>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="confirm-context" class="primary" type="submit" disabled>Прикрепить</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="replay-dialog" aria-labelledby="replay-title">
+    <form id="replay-form">
+      <div class="dialog-header"><h2 id="replay-title">Повторить тесты</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <div class="field-label">Команда</div><pre id="replay-command" class="context-text"></pre>
+      <div class="field-label">Рабочая папка</div><p id="replay-directory" class="muted replay-directory"></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Запустить</button></div>
+    </form>
   </dialog>
 
   <dialog id="settings-dialog" aria-labelledby="settings-title">
