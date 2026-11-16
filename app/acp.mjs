@@ -47,7 +47,7 @@ export class AcpClient {
   nextId = 0;
   closed = false;
 
-  constructor(cwd, runtime, { onUpdate, onPermission }) {
+  constructor(cwd, runtime, { onUpdate, onPermission, onRequest }) {
     const installed = join(homedir(), '.grok', 'bin', 'grok.exe');
     const executable = process.platform === 'win32' && existsSync(installed) ? installed : 'grok';
     this.child = spawn(executable, ['agent', 'stdio'], {
@@ -78,7 +78,11 @@ export class AcpClient {
             if (!this.closed) this.send({ id: message.id, result });
           });
       } else if (message.id != null) {
-        this.send({ id: message.id, error: { code: -32601, message: 'Unsupported client method' } });
+        const delegated = onRequest && ['fs/read_text_file', 'fs/write_text_file'].includes(message.method);
+        const reply = delegated ? Promise.resolve().then(() => onRequest(message.method, message.params))
+          .then(result => ({ result }), error => ({ error: { code: -32603, message: error.message } }))
+          : Promise.resolve({ error: { code: -32601, message: 'Unsupported client method' } });
+        reply.then(response => { if (!this.closed) this.send({ id: message.id, ...response }); });
       }
     });
   }

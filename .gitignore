@@ -1,6 +1,7 @@
 /.alice-runs/
 /node_modules/
 /dist/
+/app/ui/editor.bundle.js
 /.env
 /.env.*
 *.sqlite*

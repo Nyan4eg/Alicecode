@@ -40,9 +40,15 @@ export class Store {
       CREATE TABLE IF NOT EXISTS run_reviews (
         messageId INTEGER PRIMARY KEY REFERENCES messages(id), summary TEXT NOT NULL, files TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS managed_edits (
+        id INTEGER PRIMARY KEY, messageId INTEGER NOT NULL REFERENCES messages(id), path TEXT NOT NULL,
+        beforeText TEXT NOT NULL, afterText TEXT NOT NULL, state TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS managed_edits_message ON managed_edits(messageId, path);
+      CREATE TABLE IF NOT EXISTS session_cleanup (sessionId TEXT PRIMARY KEY);
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
-    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT' });
+    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER' });
     this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'" });
     this.db.prepare('UPDATE chats SET modelId=? WHERE modelId IS NULL').run(legacyModel.id);
     this.db.function('search_fold', { deterministic: true }, fold);
@@ -62,6 +68,18 @@ export class Store {
   set(key, value) {
     this.db.prepare('INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
       .run(key, value);
+  }
+
+  transaction(operation) {
+    this.db.exec('BEGIN');
+    try {
+      const result = operation();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   addProject(title, path) {
@@ -97,13 +115,13 @@ export class Store {
   select(id) {
     const chat = this.chat(id);
     this.set('activeChat', chat.id);
-    this.set(`lastChat:${chat.projectId}`, chat.id);
+    if (!chat.archivedAt) this.set(`lastChat:${chat.projectId}`, chat.id);
     return chat;
   }
 
   selectProject(projectId) {
     const recent = this.setting(`lastChat:${projectId}`);
-    const chat = this.db.prepare(`SELECT id FROM chats WHERE projectId=?
+    const chat = this.db.prepare(`SELECT id FROM chats WHERE projectId=? AND archivedAt IS NULL
       ORDER BY (id=?) DESC, updatedAt DESC, rowid DESC LIMIT 1`).get(projectId, recent ?? '');
     return chat ? this.select(chat.id) : this.addChat(projectId);
   }
@@ -120,7 +138,59 @@ export class Store {
     }
   }
 
-  search(value) {
+  leaveChat(chat) {
+    const last = 'lastChat:' + chat.projectId;
+    const inProject = this.db.prepare('SELECT id FROM chats WHERE projectId=? AND archivedAt IS NULL ORDER BY updatedAt DESC,rowid DESC LIMIT 1')
+      .get(chat.projectId);
+    const removeSetting = this.db.prepare('DELETE FROM settings WHERE key=?');
+    if (this.setting(last) === chat.id) {
+      if (inProject) this.set(last, inProject.id);
+      else removeSetting.run(last);
+    }
+    if (this.setting('activeChat') === chat.id) {
+      const next = inProject ?? this.db.prepare('SELECT id FROM chats WHERE archivedAt IS NULL ORDER BY updatedAt DESC,rowid DESC LIMIT 1').get();
+      if (next) this.set('activeChat', next.id);
+      else removeSetting.run('activeChat');
+    }
+  }
+
+  archiveChat(id, archived) {
+    return this.transaction(() => {
+      const chat = this.chat(id);
+      if (archived && !chat.archivedAt) {
+        this.db.prepare('UPDATE chats SET archivedAt=? WHERE id=?').run(Date.now(), id);
+        this.leaveChat(chat);
+      } else if (!archived && chat.archivedAt) {
+        this.db.prepare('UPDATE chats SET archivedAt=NULL WHERE id=?').run(id);
+        this.select(id);
+      }
+    });
+  }
+
+  deleteChat(id) {
+    return this.transaction(() => {
+      const chat = this.chat(id);
+      this.db.prepare('DELETE FROM managed_edits WHERE messageId IN (SELECT id FROM messages WHERE chatId=?)').run(id);
+      this.db.prepare('DELETE FROM run_reviews WHERE messageId IN (SELECT id FROM messages WHERE chatId=?)').run(id);
+      this.db.prepare('DELETE FROM messages WHERE chatId=?').run(id);
+      this.db.prepare('DELETE FROM chats WHERE id=?').run(id);
+      this.leaveChat(chat);
+      if (chat.sessionId && !this.db.prepare('SELECT 1 FROM chats WHERE sessionId=?').get(chat.sessionId)) {
+        this.db.prepare('INSERT OR IGNORE INTO session_cleanup VALUES (?)').run(chat.sessionId);
+      }
+    });
+  }
+
+  sessionsToRemove() {
+    return this.db.prepare('SELECT sessionId FROM session_cleanup WHERE NOT EXISTS (SELECT 1 FROM chats WHERE chats.sessionId=session_cleanup.sessionId)')
+      .all().map(row => row.sessionId);
+  }
+
+  finishSessionRemoval(id) {
+    this.db.prepare('DELETE FROM session_cleanup WHERE sessionId=?').run(id);
+  }
+
+  search(value, includeArchived = false) {
     const query = fold(typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, 120) : '');
     if (!query) return [];
     return this.db.prepare(`
@@ -129,15 +199,17 @@ export class Store {
           p.title AS projectTitle, NULL AS chatTitle, p.title AS matchText, 0 AS recency FROM projects p
         UNION ALL
         SELECT 'chat', p.id, c.id, NULL, p.title, c.title, c.title, c.updatedAt
-          FROM chats c JOIN projects p ON p.id=c.projectId
+          FROM chats c JOIN projects p ON p.id=c.projectId WHERE (? OR c.archivedAt IS NULL)
         UNION ALL
         SELECT 'message', p.id, c.id, m.id, p.title, c.title, m.text, c.updatedAt
-          FROM messages m JOIN chats c ON c.id=m.chatId JOIN projects p ON p.id=c.projectId WHERE m.text <> ''
+          FROM messages m JOIN chats c ON c.id=m.chatId JOIN projects p ON p.id=c.projectId
+          WHERE m.text <> '' AND (? OR c.archivedAt IS NULL)
       )
       SELECT * FROM results WHERE instr(search_fold(matchText), ?) > 0
       ORDER BY CASE kind WHEN 'project' THEN 0 WHEN 'chat' THEN 1 ELSE 2 END,
         recency DESC, messageId DESC LIMIT 40
-    `).all(query).map(({ matchText, recency, ...result }) => ({ ...result, snippet: snippet(matchText, query) }));
+    `).all(Number(includeArchived === true), Number(includeArchived === true), query)
+      .map(({ matchText, recency, ...result }) => ({ ...result, snippet: snippet(matchText, query) }));
   }
 
   setModel(chatId, modelId) {
@@ -186,6 +258,27 @@ export class Store {
     return review;
   }
 
+  startManagedEdit(messageId, path, before, after) {
+    return Number(this.db.prepare("INSERT INTO managed_edits (messageId,path,beforeText,afterText,state) VALUES (?,?,?,?,'pending')")
+      .run(messageId, path, before, after).lastInsertRowid);
+  }
+
+  finishManagedEdit(id, applied) {
+    if (applied) this.db.prepare("UPDATE managed_edits SET state='applied' WHERE id=?").run(id);
+    else this.db.prepare("DELETE FROM managed_edits WHERE id=? AND state='pending'").run(id);
+  }
+
+  managedEdits(chatId, messageId, path) {
+    return this.db.prepare(`SELECT e.id,e.beforeText,e.afterText FROM managed_edits e JOIN messages m ON m.id=e.messageId
+      WHERE m.chatId=? AND m.id=? AND m.status<>'running' AND e.path=? AND e.state='applied' ORDER BY e.id DESC`)
+      .all(chatId, messageId, path);
+  }
+
+  markRolledBack(edits) {
+    const update = this.db.prepare("UPDATE managed_edits SET state='reverted' WHERE id=? AND state='applied'");
+    this.transaction(() => { for (const edit of edits) update.run(edit.id); });
+  }
+
   reviewFile(chatId, messageId, path) {
     const row = this.db.prepare(`SELECT run_reviews.files FROM run_reviews JOIN messages ON messages.id=messageId
       WHERE messageId=? AND chatId=?`).get(messageId, chatId);
@@ -203,10 +296,13 @@ export class Store {
     const activeChat = this.setting('activeChat') ?? null;
     const projects = this.db.prepare('SELECT * FROM projects ORDER BY rowid DESC').all();
     const chats = this.db.prepare('SELECT * FROM chats ORDER BY updatedAt DESC, rowid DESC').all();
-    const messages = activeChat ? this.db.prepare(`SELECT messages.*, run_reviews.summary FROM messages
+    const messages = activeChat ? this.db.prepare(`SELECT messages.*, run_reviews.summary,
+      (SELECT json_group_array(DISTINCT path) FROM managed_edits WHERE messageId=messages.id AND state='applied') AS managed
+      FROM messages
       LEFT JOIN run_reviews ON messageId=messages.id WHERE chatId=? ORDER BY messages.id`).all(activeChat)
-      .map(({ summary, ...message }) => ({ ...message, tools: JSON.parse(message.tools),
-        attachments: JSON.parse(message.attachments), review: summary ? JSON.parse(summary) : null })) : [];
+      .map(({ summary, managed, ...message }) => ({ ...message, tools: JSON.parse(message.tools),
+        attachments: JSON.parse(message.attachments), review: summary ? JSON.parse(summary) : null,
+        managedPaths: JSON.parse(managed) })) : [];
     return { activeChat, projects, chats, messages };
   }
 }

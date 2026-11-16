@@ -214,6 +214,38 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 .replay-directory { overflow-wrap: anywhere; font-family: var(--code); }
 #context-status { margin: 8px 0 4px; }
 .preview-heading > div { flex: 1; }
+.chat-actions-button { font-size: 16px; }
+.archive-group { margin: 3px 0 4px 19px; }
+.archive-group summary { padding: 4px 5px; color: var(--muted); cursor: pointer; font-size: 12px; }
+.archive-group .chat-row { margin-left: 1px; }
+.archive-banner { display: flex; align-items: center; justify-content: space-between; }
+.chat-actions-list { display: grid; gap: 4px; }
+.chat-actions-list button { text-align: left; }
+.danger { color: #a32d42; }
+.danger-fill { background: #9e3245; }
+.danger-fill:hover:not(:disabled) { background: #81283a; }
+.check-label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+.check-label input { width: auto; accent-color: var(--accent); }
+.changes-dialog { width: min(760px, 92vw); }
+.changes-dialog select { max-width: 100%; padding: 5px; color: inherit; border: 1px solid var(--line); border-radius: 6px; }
+.changes-dialog .context-text { max-height: min(47vh, 390px); }
+.changes-dialog p { overflow-wrap: anywhere; }
+#commit-paths { max-height: 68px; white-space: pre-line; overflow: auto; font: 12px var(--code); }
+#commit-message { border: 1px solid var(--line); border-radius: 7px; padding: 8px; }
+#hunks-list { max-height: min(54vh, 440px); overflow: auto; }
+.git-actions { display: flex; gap: 4px; flex-wrap: wrap; padding: 3px 7px; border-bottom: 1px solid var(--line); }
+.git-actions button, .rollback-button { color: var(--accent-dark); font-size: 12px; padding: 5px 8px; }
+.editor-tabs { display: flex; gap: 3px; overflow: auto; padding: 5px; min-height: 34px; flex: 0 0 auto; background: #f8f6fc; }
+.editor-tab { display: flex; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 6px; }
+.editor-tab button { padding: 3px 6px; white-space: nowrap; font: 11px var(--code); }
+.editor-tab button[aria-current="true"] { color: var(--accent-dark); background: var(--soft); }
+.editor-close { color: var(--muted); }
+#editor-host { flex: 1; min-height: 0; overflow: hidden; background: #fbfafc; }
+#editor-host > .cm-editor { height: 100%; font: 12px/1.6 var(--code); }
+#editor-host .cm-content, #editor-host .cm-gutter { font-family: var(--code); }
+#editor-host .cm-panels { font: 12px/1.4 "Inter", "Segoe UI", sans-serif; }
+#editor-host .cm-panel input { width: auto; }
+.rollback-button { margin-left: 4px; }
 @media (max-width: 1000px) {
   .topbar { padding: 0 15px; }
   .composer-area { padding-right: 14px; padding-left: 14px; }

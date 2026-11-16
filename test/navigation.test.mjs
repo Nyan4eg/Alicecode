@@ -7,6 +7,37 @@ import { normalizeLayout } from '../app/layout.mjs';
 import { availableModels } from '../app/models.mjs';
 import { Store } from '../app/store.mjs';
 
+test('archive is reversible and deletion removes only the selected chat data', t => {
+  const store = new Store(':memory:');
+  t.after(() => store.db.close());
+  const old = store.addProject('Калькулятор', 'C:/work/calculator');
+  const next = store.addChat(old.projectId);
+  store.select(old.id);
+  store.setSession(old.id, 'session-delete');
+  store.setModel(old.id, 'deepseek-v4.1-flash');
+  const answer = store.beginTurn(old.id, 'Редкая фраза', 'deepseek-v4.1-flash');
+  store.saveTurn(answer, { text: 'Ответ', status: 'done', tools: [] });
+  store.saveReview(answer, { state: 'ready', files: [] });
+  const record = store.startManagedEdit(answer, 'a.js', 'before', 'after');
+  store.finishManagedEdit(record, true);
+  store.archiveChat(old.id, true);
+  assert.equal(store.snapshot().activeChat, next.id);
+  assert.equal(store.search('редкая фраза').length, 0);
+  assert.ok(store.search('редкая фраза', true).some(hit => hit.chatId === old.id));
+  store.archiveChat(old.id, false);
+  assert.equal(store.chat(old.id).modelId, 'deepseek-v4.1-flash');
+  assert.equal(store.chat(old.id).sessionId, 'session-delete');
+  assert.deepEqual(store.snapshot().messages.at(-1).managedPaths, ['a.js']);
+  store.deleteChat(old.id);
+  assert.equal(store.snapshot().activeChat, next.id);
+  assert.equal(store.search('редкая фраза', true).length, 0);
+  assert.equal(store.snapshot().projects.length, 1);
+  assert.deepEqual(store.sessionsToRemove(), ['session-delete']);
+  for (const table of ['messages', 'run_reviews', 'managed_edits']) {
+    assert.equal(store.db.prepare('SELECT count(*) n FROM ' + table).get().n, 0);
+  }
+});
+
 test('rename preserves the workspace, session, and a title chosen before the first message', t => {
   const store = new Store(':memory:');
   t.after(() => store.db.close());

@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
-import { basename, join, resolve } from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { basename, dirname, join, relative, resolve } from 'node:path';
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.mjs';
 import { AcpClient, startRuntime } from './acp.mjs';
@@ -14,6 +15,8 @@ import { finishReview, startReview } from './review.mjs';
 import { replayDetails, runTest, testInvocation } from './replay.mjs';
 import { defaultModel, fetchModels, legacyModel, lookupModel, models } from './models.mjs';
 import { normalizeLayout } from './layout.mjs';
+import { agentEdit, agentTextForDisk, editDiff, editableFile, editorText, planRollback, textForDisk, validateText, writeChecked } from './editing.mjs';
+import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from './git.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const cancelledPermission = () => ({ outcome: { outcome: 'cancelled' } });
@@ -27,6 +30,7 @@ let credentials;
 let credentialError;
 let runtime;
 let active;
+let workspaceMutation = false;
 let available = models;
 let catalogStatus = 'loading';
 const updates = createUpdates(state => emit('app:update', state));
@@ -35,6 +39,7 @@ function snapshot() {
   return {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
+    workspaceMutation,
     updates: updates.snapshot(),
     models: available, defaultModel: defaultModel.id, catalogStatus,
     layout: normalizeLayout(JSON.parse(store.setting('layout') ?? '{}')),
@@ -120,19 +125,32 @@ function publishTurn(turn) {
   emit('chat:message', turn.message);
 }
 
-function requestPermission(turn, params) {
+function enqueuePermission(turn, details, choose) {
   if (turn.stop || active !== turn) return cancelledPermission();
+  return new Promise(resolvePermission => {
+    turn.permissions.push({ details, choose, resolvePermission });
+    emit('app:state', snapshot());
+  });
+}
+
+async function requestPermission(turn, params) {
   const permit = params.options.find(option => option.kind === 'allow_once');
   if (!permit) return cancelledPermission();
   const reject = params.options.find(option => option.kind === 'reject_once');
-  return new Promise(resolvePermission => {
-    const details = {
-      id: params.toolCall.toolCallId,
-      chatId: turn.chatId,
-      ...describePermission(params.toolCall, turn.cwd, turn.shellCwd),
-    };
-    turn.permissions.push({ details, permit: permit.optionId, reject: reject?.optionId, resolvePermission });
-    emit('app:state', snapshot());
+  const tool = params.toolCall;
+  const details = { id: tool.toolCallId, chatId: turn.chatId, ...describePermission(tool, turn.cwd, turn.shellCwd) };
+  let proposed;
+  if (details.kind === 'edit' && details.changes.length === 1) {
+    try {
+      const before = await editableFile(turn.cwd, details.changes[0].path, true);
+      const text = agentEdit(tool, before);
+      if (typeof text === 'string') proposed = { ...before, after: text };
+    } catch {}
+  }
+  return enqueuePermission(turn, details, allow => {
+    if (allow && proposed) turn.approvedEdits.set(proposed.path, proposed);
+    const optionId = allow ? permit.optionId : reject?.optionId;
+    return optionId ? { outcome: { outcome: 'selected', optionId } } : cancelledPermission();
   });
 }
 
@@ -140,11 +158,12 @@ function resolvePermission(id, allow) {
   const p = active?.permissions[0];
   if (!p || p.details.id !== id) return;
   active.permissions.shift();
-  const tool = active.tools.get(id) ?? { id, title: p.details.title };
-  active.tools.set(id, { ...tool, decision: allow ? 'allowed' : 'denied' });
-  publishTurn(active);
-  const optionId = allow ? p.permit : p.reject;
-  p.resolvePermission(optionId ? { outcome: { outcome: 'selected', optionId } } : cancelledPermission());
+  if (p.details.kind !== 'managed-write') {
+    const tool = active.tools.get(id) ?? { id, title: p.details.title };
+    active.tools.set(id, { ...tool, decision: allow ? 'allowed' : 'denied' });
+    publishTurn(active);
+  }
+  p.resolvePermission(p.choose(allow));
   emit('app:state', snapshot());
 }
 
@@ -152,8 +171,64 @@ function cancelPermissions(turn) {
   for (const pending of turn.permissions.splice(0)) pending.resolvePermission(cancelledPermission());
 }
 
+async function fileRequest(turn, method, params) {
+  const check = () => {
+    if (active !== turn || turn.stop || (turn.sessionId && turn.sessionId !== params.sessionId)) {
+      throw new Error('Сессия больше не активна.');
+    }
+  };
+  check();
+  if (method === 'fs/read_text_file') {
+    const file = await editableFile(turn.cwd, params.path);
+    turn.fileReads.set(file.path, file.stamp);
+    if (!params.line && !params.limit) return { content: file.text };
+    const first = Math.max(0, (params.line ?? 1) - 1);
+    return { content: file.text.split(/\r?\n/).slice(first, first + (params.limit ?? Infinity)).join('\n') };
+  }
+  if (!turn.sessionId) throw new Error('Сессия ещё не открыта.');
+  validateText(params.content);
+  const file = await editableFile(turn.cwd, params.path, true);
+  const approved = turn.approvedEdits.get(file.path);
+  turn.approvedEdits.delete(file.path);
+  const readStamp = turn.fileReads.get(file.path);
+  if ((approved && approved.stamp !== file.stamp) || (readStamp !== undefined && readStamp !== file.stamp)) {
+    throw new Error('Файл изменился после чтения. Прочитайте его ещё раз перед правкой.');
+  }
+  const content = agentTextForDisk(file.text, params.content);
+  if (content === file.text) return {};
+  if (!approved || approved.after !== params.content) {
+    const patch = await editDiff(file.text, content);
+    const allow = await enqueuePermission(turn, { id: randomUUID(), chatId: turn.chatId, kind: 'managed-write',
+      title: 'Применить правку к файлу?', path: file.path, patch }, value => value);
+    if (allow !== true) throw new Error('Пользователь отклонил запись файла.');
+  }
+  check();
+  // Record only writes performed by the host. A shell command can also change the working tree.
+  const receipt = file.text === null ? null : store.startManagedEdit(turn.message.id, file.path, file.text, content);
+  let applied = false;
+  try {
+    const written = await writeChecked(turn.cwd, file, content, check);
+    turn.fileReads.set(file.path, written.stamp);
+    applied = true;
+  } finally {
+    if (receipt !== null) store.finishManagedEdit(receipt, applied);
+  }
+  return {};
+}
+
 function assertIdle() {
-  if (active) throw new Error('Дождитесь завершения текущей задачи.');
+  if (active || workspaceMutation) throw new Error('Дождитесь завершения текущей операции.');
+}
+
+async function mutateWorkspace(operation) {
+  assertIdle();
+  workspaceMutation = true;
+  emit('app:state', snapshot());
+  try { return await operation(); }
+  finally {
+    workspaceMutation = false;
+    emit('app:state', snapshot());
+  }
 }
 
 async function prepareReview(turn) {
@@ -192,6 +267,7 @@ async function send(chatId, input, refs = []) {
   const context = await resolveContext(store.chat(chatId).cwd, refs);
   assertIdle();
   const chat = store.select(chatId);
+  if (chat.archivedAt) throw new Error('Восстановите чат из архива.');
   const model = lookupModel(chat.modelId ?? legacyModel.id);
   if (!model || !available.some(item => item.id === model.id)) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
@@ -201,7 +277,8 @@ async function send(chatId, input, refs = []) {
     chatId, modelId: model.id,
     role: 'assistant', text: '', tools: [], status: 'running',
   };
-  const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare' };
+  const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
+    approvedEdits: new Map(), fileReads: new Map() };
   active = turn;
   emit('app:state', snapshot());
   const baseline = await prepareReview(turn);
@@ -216,9 +293,10 @@ async function send(chatId, input, refs = []) {
     turn.client = new AcpClient(chat.cwd, runtime, {
       onUpdate: update => updateTurn(turn, update),
       onPermission: params => requestPermission(turn, params),
+      onRequest: (method, params) => fileRequest(turn, method, params),
     });
     const init = await turn.client.request('initialize', {
-      protocolVersion: 1, clientCapabilities: {},
+      protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
       clientInfo: { name: 'alicecode', title: 'Alicecode', version: app.getVersion() },
     });
     if (init._meta?.modelState?.currentModelId !== alias) {
@@ -250,7 +328,8 @@ async function send(chatId, input, refs = []) {
 }
 
 async function getReplay(chatId, messageId, toolId) {
-  const cwd = store.chat(chatId).cwd;
+  const { cwd, archivedAt } = store.chat(chatId);
+  if (archivedAt) throw new Error('Восстановите чат из архива.');
   const details = await replayDetails(cwd, store.messageTool(chatId, messageId, toolId));
   if (!details) throw new Error('Эту команду нельзя повторить из журнала. Нужен отдельный запуск тестов в папке проекта.');
   return details;
@@ -310,6 +389,58 @@ function selectedPath(chatId) {
   return store.chat(chatId).cwd;
 }
 
+async function editorFile(chatId, path) {
+  const file = await editableFile(selectedPath(chatId), path);
+  return { path: file.path, stamp: file.stamp, text: editorText(file.text) };
+}
+
+async function saveEditor(chatId, path, expected, draft) {
+  const root = selectedPath(chatId);
+  const file = await editableFile(root, path);
+  const text = textForDisk(file.text, draft);
+  if (file.stamp !== expected) return { conflict: true, path: file.path, stamp: file.stamp,
+    text: editorText(file.text), patch: await editDiff(file.text, text) };
+  const saved = await writeChecked(root, file, text);
+  return { path: saved.path, stamp: saved.stamp, text: editorText(saved.text) };
+}
+
+async function rollbackDetails(chatId, messageId, path) {
+  const root = selectedPath(chatId);
+  const edits = store.managedEdits(chatId, messageId, path);
+  const result = await planRollback(root, path, edits);
+  return { root, edits, result };
+}
+
+async function removeLocalSessions() {
+  const pending = store.sessionsToRemove();
+  if (!pending.length) return;
+  const home = join(app.getPath('userData'), 'agent', 'sessions');
+  try {
+    if (!(await lstat(home)).isDirectory() || relative(await realpath(home), home)) return;
+  } catch (error) {
+    if (error.code === 'ENOENT') for (const id of pending) store.finishSessionRemoval(id);
+    return;
+  }
+  let groups;
+  try { groups = await readdir(home, { withFileTypes: true }); } catch { return; }
+  for (const id of pending) {
+    if (!/^[a-z0-9_-]{8,128}$/i.test(id)) continue;
+    try {
+      for (const group of groups.filter(entry => entry.isDirectory() && !entry.isSymbolicLink())) {
+        const folder = join(home, group.name, id);
+        const entry = await lstat(folder).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        if (!entry?.isDirectory() || entry.isSymbolicLink()) continue;
+        const actual = await realpath(folder);
+        if (relative(folder, actual) || relative(home, dirname(dirname(actual)))) continue;
+        await rm(actual, { recursive: true, force: true });
+      }
+      store.finishSessionRemoval(id);
+    } catch {
+      // The pending deletion will be retried when the profile opens.
+    }
+  }
+}
+
 async function makeWindow() {
   window = new BrowserWindow({
     title: 'Alicecode', backgroundColor: '#f7f6fa',
@@ -319,6 +450,12 @@ async function makeWindow() {
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
+  window.webContents.on('will-prevent-unload', event => {
+    const choice = dialog.showMessageBoxSync(window, { type: 'question', title: 'Несохранённые изменения',
+      message: 'В редакторе есть несохранённые файлы.', buttons: ['Вернуться', 'Закрыть без сохранения'],
+      cancelId: 0, defaultId: 0 });
+    if (choice === 1) event.preventDefault();
+  });
   window.once('ready-to-show', () => window.show());
   await window.loadFile(join(directory, 'ui', 'index.html'));
 }
@@ -332,6 +469,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
+    await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
     bind('project:create', async (name, parent) => {
@@ -358,21 +496,51 @@ if (!app.requestSingleInstanceLock()) {
     bind('project:directory', (chatId, path) => listDirectory(selectedPath(chatId), path));
     bind('project:search-files', (chatId, query) => searchFiles(selectedPath(chatId), query));
     bind('project:read', (chatId, path) => readProjectFile(selectedPath(chatId), path));
+    bind('project:editor', editorFile);
+    bind('project:save-file', (...args) => mutateWorkspace(() => saveEditor(...args)));
     bind('project:diff', (chatId, path, scope) => readProjectDiff(selectedPath(chatId), path, scope));
     bind('project:context', (chatId, path, start, end) => previewContext(selectedPath(chatId), path, start, end));
+    bind('git:stage', (chatId, path, staged) => mutateWorkspace(() => stageFile(selectedPath(chatId), path, staged === true)));
+    bind('git:hunks', (chatId, path, scope) => gitHunks(selectedPath(chatId), path, scope));
+    bind('git:stage-hunks', (chatId, ...args) => mutateWorkspace(() => stageHunks(selectedPath(chatId), ...args)));
+    bind('git:commit-preview', chatId => commitPreview(selectedPath(chatId)));
+    bind('git:commit', (chatId, token, message) => mutateWorkspace(() => createCommit(selectedPath(chatId), token, message)));
     bind('chat:review-file', (chatId, messageId, path) => store.reviewFile(chatId, messageId, path));
+    bind('chat:rollback-preview', async (chatId, messageId, path) => {
+      const { root, result } = await rollbackDetails(chatId, messageId, path);
+      const staged = (await listChanges(root)).some(item => item.path === path && item.staged);
+      return { token: result.token, conflict: result.conflict, patch: result.patch, staged };
+    });
+    bind('chat:rollback', (chatId, messageId, path, token) => mutateWorkspace(async () => {
+      const { root, edits, result } = await rollbackDetails(chatId, messageId, path);
+      if (token !== result.token || result.conflict) throw new Error('Файл изменился. Откройте предпросмотр отката заново.');
+      await writeChecked(root, result.file, result.text);
+      store.markRolledBack(edits);
+    }));
     bind('project:select', projectId => { store.selectProject(projectId); return snapshot(); });
     bind('project:rename', (id, title) => { store.renameProject(id, title); return snapshot(); });
     bind('chat:new', projectId => { store.addChat(projectId); return snapshot(); });
     bind('chat:select', chatId => { store.select(chatId); return snapshot(); });
     bind('chat:rename', (id, title) => { store.renameChat(id, title); return snapshot(); });
+    bind('chat:archive', (id, archived) => {
+      if (active?.chatId === id) throw new Error('Завершите задачу перед архивированием.');
+      store.archiveChat(id, archived === true);
+      return snapshot();
+    });
+    bind('chat:delete', async id => {
+      if (active?.chatId === id || workspaceMutation) throw new Error('Завершите текущую операцию перед удалением.');
+      store.deleteChat(id);
+      await removeLocalSessions();
+      return snapshot();
+    });
     bind('chat:model', (id, modelId) => {
       if (active?.chatId === id) throw new Error('Смените модель после завершения ответа.');
+      if (store.chat(id).archivedAt) throw new Error('Восстановите чат из архива.');
       if (!available.some(model => model.id === modelId)) throw new Error('Модель недоступна в каталоге.');
       store.setModel(id, modelId);
       return snapshot();
     });
-    bind('history:search', query => store.search(query));
+    bind('history:search', (query, includeArchived) => store.search(query, includeArchived));
     bind('settings:layout', value => store.set('layout', JSON.stringify(normalizeLayout(value))));
     bind('settings:models', refreshModels);
     bind('chat:send', send);
@@ -385,7 +553,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('chat:replay-test', replay);
     bind('updates:check', async () => { await updates.check(); return updates.snapshot(); });
     bind('updates:install', () => {
-      if (active) throw new Error('Завершите текущую задачу перед обновлением.');
+      assertIdle();
       updates.install();
     });
     bind('settings:save', async value => {

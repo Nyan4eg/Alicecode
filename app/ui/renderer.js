@@ -33,6 +33,16 @@ let fileTimer;
 let contextTimer;
 let replayTarget;
 let sending = false;
+const openArchives = new Set();
+const editorFiles = new Map();
+let editView;
+let editor;
+let editorConflict;
+let editorRequest = 0;
+let chatAction;
+let rollbackTarget;
+let stageTarget;
+let commitTarget;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -86,7 +96,7 @@ function renderNavigation() {
     const projectRow = element('div', 'nav-row');
     projectRow.append(title, renameButton('project', project));
     group.append(projectRow);
-    for (const chat of chats) {
+    function chatRow(chat) {
       const item = element('button', 'chat-item', chat.title);
       item.title = chat.title;
       item.setAttribute('aria-current', String(chat.id === state.activeChat));
@@ -96,9 +106,26 @@ function renderNavigation() {
         item.append(badge);
       }
       item.addEventListener('click', () => select(chat.id));
-      const chatRow = element('div', 'nav-row chat-row');
-      chatRow.append(item, renameButton('chat', chat));
-      group.append(chatRow);
+      const actions = element('button', 'quiet rename-item chat-actions-button', '⋯');
+      actions.type = 'button';
+      actions.title = 'Действия с чатом';
+      actions.setAttribute('aria-label', 'Действия с чатом «' + chat.title + '»');
+      actions.addEventListener('click', () => openChatActions(chat));
+      const row = element('div', 'nav-row chat-row');
+      row.append(item, actions);
+      return row;
+    }
+    for (const chat of chats.filter(item => !item.archivedAt)) group.append(chatRow(chat));
+    const archived = chats.filter(item => item.archivedAt);
+    if (archived.length) {
+      const archive = element('details', 'archive-group');
+      archive.open = openArchives.has(project.id) || archived.some(item => item.id === state.activeChat);
+      archive.addEventListener('toggle', () => {
+        if (archive.open) openArchives.add(project.id);
+        else openArchives.delete(project.id);
+      });
+      archive.append(element('summary', '', 'Архив · ' + archived.length), ...archived.map(chatRow));
+      group.append(archive);
     }
     tree.append(group);
   }
@@ -228,6 +255,13 @@ function workSummary(message, paths) {
     if (note) panel.append(element('p', 'work-note', note));
     if (skipped) panel.append(element('p', 'work-note', `Не удалось показать изменения для ${skipped} файлов.`));
   }
+  if (message.managedPaths?.length && message.status !== 'running') {
+    const revert = element('button', 'quiet rollback-button', 'Откатить правки…');
+    revert.type = 'button';
+    revert.disabled = Boolean(state.busy || state.workspaceMutation);
+    revert.addEventListener('click', () => openRollback(message));
+    panel.append(revert);
+  }
   if (!tools.length) return panel;
   const journal = disclosure(`${message.id}:journal`, `Журнал действий · ${tools.length}`);
   const list = element('div', 'tool-list');
@@ -241,7 +275,7 @@ function workSummary(message, paths) {
       if (tool.repeatable && message.status !== 'running') {
         const repeat = element('button', 'quiet', 'Повторить');
         repeat.type = 'button';
-        repeat.disabled = Boolean(state.busy);
+        repeat.disabled = Boolean(state.busy || state.workspaceMutation || activeChat()?.archivedAt);
         repeat.addEventListener('click', () => confirmReplay(message, tool));
         footer.append(repeat);
       }
@@ -293,7 +327,7 @@ function renderMessage(message) {
     .flatMap(tool => tool.paths ?? []))];
   const visibleFiles = [...folders.values()].flatMap(folder => (folder.entries ?? []).filter(item => !item.directory).map(item => item.path));
   const references = [...new Set([...paths, ...visibleFiles, ...(workspace?.changes ?? []).map(item => item.path)])];
-  if (message.tools.length || message.review) row.append(workSummary(message, paths));
+  if (message.tools.length || message.review || message.managedPaths?.length) row.append(workSummary(message, paths));
   row.append(formatMessage(message.text, references));
   if (message.error) row.append(element('p', 'error', message.error));
   if (message.status === 'cancelled') row.append(element('p', 'busy-text', 'Задача остановлена.'));
@@ -327,6 +361,8 @@ function renderThread(forceScroll) {
 function renderComposer() {
   const chat = activeChat();
   $('composer-area').hidden = !chat;
+  $('archive-banner').hidden = !chat?.archivedAt;
+  $('composer').hidden = Boolean(chat?.archivedAt);
   $('stop').hidden = state.busy !== chat?.id || state.busyStage === 'review';
   const permission = state.permission;
   $('permission').hidden = !permission || permission.chatId !== chat?.id;
@@ -347,7 +383,8 @@ function renderComposer() {
   noticeNode.hidden = !notice && !other;
   $('prompt').disabled = !state.configured;
   $('attach-file').disabled = !chat || !state.configured || currentContext().length >= 6;
-  $('send').disabled = !chat || !state.configured || !available || Boolean(state.busy) || sending || !$('prompt').value.trim();
+  $('send').disabled = !chat || chat.archivedAt || !state.configured || !available || Boolean(state.busy || state.workspaceMutation)
+    || sending || !$('prompt').value.trim();
   renderAttachments();
 }
 
@@ -368,7 +405,7 @@ function renderModels() {
     picker.prepend(unavailable);
   }
   picker.value = current;
-  picker.disabled = !chat || !state.configured || state.busy === chat.id;
+  picker.disabled = !chat || Boolean(chat.archivedAt) || !state.configured || state.busy === chat.id;
   $('provider').classList.toggle('connected', state.configured);
   const selected = state.models.find(model => model.id === current);
   const time = selected?.medianSeconds?.toLocaleString('ru-RU');
@@ -394,6 +431,9 @@ function renderPermission(permission) {
     content.append(element('pre', 'permission-command', permission.command),
       element('div', 'permission-field', permission.directoryLabel),
       element('code', 'permission-path', permission.directory));
+  } else if (permission.kind === 'managed-write') {
+    content.append(element('code', 'permission-path', permission.path),
+      element('pre', 'permission-after', permission.patch));
   } else if (permission.kind === 'edit') {
     for (const change of permission.changes) {
       const entry = element('div', 'permission-edit');
@@ -453,6 +493,7 @@ function updateState(next) {
     if (priorProject !== activeChat()?.projectId) {
       expandedFolders.clear();
       folderLimits.clear();
+      hideEditor();
     }
     review = undefined;
     if (tab === 'review') selectTab('files');
@@ -474,7 +515,8 @@ function updateState(next) {
   renderComposer();
   renderThread(changed);
   renderUpdates();
-  if (changed || previous?.busy && !state.busy) refreshWorkspace();
+  renderEditorTabs();
+  if (changed || previous?.busy && !state.busy || previous?.workspaceMutation && !state.workspaceMutation) refreshWorkspace();
   else if (!previous) renderWorkspace();
 }
 
@@ -484,7 +526,7 @@ async function select(chatId) {
 }
 
 async function selectProject(projectId) {
-  if (!projectId || activeChat()?.projectId === projectId) return;
+  if (!projectId || (activeChat()?.projectId === projectId && !activeChat()?.archivedAt)) return;
   try { updateState(await api.selectProject(projectId)); } catch (error) { toast(error); }
 }
 
@@ -523,7 +565,7 @@ function renderSearch(results, status) {
     row.tabIndex = -1;
     row.type = 'button';
     const kind = { project: 'Проект', chat: 'Чат', message: 'Сообщение' }[result.kind];
-    const location = [kind, result.kind !== 'project' && result.projectTitle,
+    const location = [kind, state.chats.find(chat => chat.id === result.chatId)?.archivedAt && 'Архив', result.kind !== 'project' && result.projectTitle,
       result.kind === 'message' && result.chatTitle].filter(Boolean).join(' · ');
     row.append(element('strong', '', result.snippet), element('small', '', location));
     row.addEventListener('click', () => openSearchResult(result));
@@ -543,7 +585,7 @@ function searchHistory() {
   renderSearch([], 'Поиск…');
   searchTimer = setTimeout(async () => {
     try {
-      const results = await api.search(query);
+      const results = await api.search(query, $('search-archive').checked);
       if (id !== searchRequest || !$('history-dialog').open) return;
       renderSearch(results, results.length ? '' : 'Ничего не найдено.');
     } catch (error) {
@@ -576,6 +618,7 @@ function selectTab(next) {
   tab = next;
   $('review-tab').hidden = !review;
   for (const name of ['files', 'changes', 'review']) $(`${name}-tab`).setAttribute('aria-selected', String(tab === name));
+  renderEditorTabs();
 }
 
 function showInspector(visible, persist = true) {
@@ -603,7 +646,7 @@ function renderLayout() {
   const compact = window.innerWidth <= 850;
   const medium = window.innerWidth <= 1000;
   const defaults = { sidebar: compact ? 165 : medium ? 190 : 231,
-    inspector: preview ? compact ? 280 : Math.max(340, Math.min(580, window.innerWidth * .33))
+    inspector: (preview || editView) ? compact ? 280 : Math.max(340, Math.min(650, window.innerWidth * (editView ? .45 : .33)))
       : compact ? 180 : medium ? 210 : 255 };
   for (const key of ['sidebar', 'inspector']) {
     const width = clampWidth(key, layout[key] ?? defaults[key]);
@@ -661,14 +704,25 @@ function bindGrip(key, direction) {
 
 function renderPreview() {
   $('inline-preview').hidden = !preview;
-  $('inspector').classList.toggle('reviewing', Boolean(preview));
+  $('inspector').classList.toggle('reviewing', Boolean(preview || editView));
   renderLayout();
   if (!preview) return;
   setText('preview-title', preview.path).title = preview.path;
   const mode = preview.mode === 'review' ? 'Изменения за запуск' : preview.mode === 'files' ? 'Файл'
     : { staged: 'В индексе Git', unstaged: 'В рабочей папке Git', all: 'Все изменения Git' }[preview.scope];
   setText('preview-mode', mode);
+  $('edit-preview').hidden = preview.mode !== 'files' || Boolean(preview.loading || preview.error);
   $('attach-preview').hidden = preview.mode !== 'files' || Boolean(preview.error) || !preview.text || !state.configured;
+  const change = workspace?.changes.find(item => item.path === preview.path);
+  const gitScope = preview.scope;
+  const canStage = preview.mode === 'changes' && Boolean(change)
+    && (gitScope === 'staged' ? change.staged : change.unstaged || change.untracked);
+  const busy = Boolean(state.busy || state.workspaceMutation);
+  $('preview-git').hidden = !canStage;
+  const stage = setText('stage-file', gitScope === 'staged' ? 'Убрать файл из индекса' : 'Добавить файл в индекс');
+  stage.disabled = busy;
+  $('stage-hunks').disabled = busy;
+  $('stage-hunks').hidden = !preview.text?.includes('\n@@ ') || change?.[gitScope] !== 'M';
   const body = $('preview-content');
   body.setAttribute('aria-label', preview.mode === 'files' ? 'Содержимое файла' : 'Изменения файла');
   body.replaceChildren();
@@ -721,6 +775,7 @@ function renderPreview() {
 async function openPreview(path, mode, { line = null, scope = 'all', messageId = review?.messageId } = {}) {
   if (!state.activeChat) return;
   const chatId = state.activeChat;
+  hideEditor();
   const id = ++previewRequest;
   if (!layout.inspectorVisible) showInspector(true);
   selectTab(mode);
@@ -847,6 +902,8 @@ function renderWorkspace() {
   const focusedFolder = document.activeElement?.dataset.folder;
   root.replaceChildren();
   const count = workspace?.changes.length ?? 0;
+  $('git-actions').hidden = tab !== 'changes' || !state.activeChat;
+  $('open-commit').disabled = Boolean(state.busy || state.workspaceMutation);
   setText('changes-count', String(count)).hidden = !count;
   if (!state.activeChat) {
     root.append(element('p', '', 'Выберите проект.'));
@@ -1344,6 +1401,7 @@ document.addEventListener('keydown', event => {
 $('close-preview').addEventListener('click', closePreview);
 for (const name of ['files', 'changes', 'review']) {
   $(`${name}-tab`).addEventListener('click', () => {
+    if (name !== 'files') hideEditor();
     if (tab !== name) closePreview();
     selectTab(name);
     if (name === 'review') {
@@ -1351,4 +1409,301 @@ for (const name of ['files', 'changes', 'review']) {
     } else refreshWorkspace();
   });
 }
+function openChatActions(chat) {
+  chatAction = chat;
+  setText('chat-actions-title', chat.title);
+  setText('toggle-archive-chat', chat.archivedAt ? 'Восстановить из архива' : 'В архив').disabled = state.busy === chat.id;
+  $('request-delete-chat').disabled = state.busy === chat.id || state.workspaceMutation;
+  $('chat-actions-dialog').showModal();
+}
+
+async function toggleArchive(chat) {
+  if (!chat) return;
+  try {
+    if (!chat.archivedAt) openArchives.add(chat.projectId);
+    updateState(await api.archiveChat(chat.id, !chat.archivedAt));
+  } catch (error) { toast(error); }
+}
+
+function editorGroup() {
+  const projectId = activeChat()?.projectId;
+  if (!editorFiles.has(projectId) && projectId) editorFiles.set(projectId, new Map());
+  return editorFiles.get(projectId);
+}
+
+function renderEditorTabs() {
+  const tabs = $('editor-tabs');
+  const files = editorGroup();
+  tabs.hidden = tab !== 'files' || !files?.size;
+  tabs.replaceChildren();
+  if (tabs.hidden) return;
+  for (const file of files.values()) {
+    const group = element('span', 'editor-tab');
+    const open = element('button', 'quiet', file.path.split('/').at(-1) + (file.dirty ? ' ●' : ''));
+    open.title = file.path + (file.dirty ? ' — есть несохранённые изменения' : '');
+    open.setAttribute('aria-current', String(editView === file));
+    open.addEventListener('click', () => openEditor(file.path));
+    const close = element('button', 'quiet editor-close', '×');
+    close.setAttribute('aria-label', 'Закрыть ' + file.path);
+    close.addEventListener('click', () => closeEditorTab(files, file));
+    group.append(open, close);
+    tabs.append(group);
+  }
+  $('save-file').disabled = !editView?.dirty || Boolean(state.busy || state.workspaceMutation);
+}
+
+function hideEditor() {
+  editorRequest++;
+  if (!editView) return;
+  editor?.destroy();
+  editor = undefined;
+  editView = undefined;
+  $('inline-editor').hidden = true;
+  $('inspector').classList.toggle('reviewing', Boolean(preview));
+  renderLayout();
+}
+
+function showEditor(file, line, focus = true) {
+  hideEditor();
+  preview = undefined;
+  previewRequest++;
+  editView = file;
+  editor = window.aliceEditor.create($('editor-host'), file, text => {
+    const changed = file.dirty !== (text !== file.cleanText);
+    file.text = text;
+    file.dirty = text !== file.cleanText;
+    if (changed) renderEditorTabs();
+  }, saveCurrentFile);
+  $('inline-editor').hidden = false;
+  setText('editor-title', file.path).title = file.path;
+  selectTab('files');
+  renderPreview();
+  renderWorkspace();
+  if (line) editor.line(line);
+  if (focus) editor.focus();
+}
+
+async function openEditor(path, line) {
+  if (editView?.path === path) {
+    if (line) editor.line(line);
+    editor.focus();
+    return;
+  }
+  if (!window.aliceEditor) return toast('Редактор не загрузился. Перезапустите Alicecode.');
+  const files = editorGroup();
+  if (!files) return;
+  const request = ++editorRequest;
+  try {
+    let file = files.get(path);
+    if (!file?.dirty) {
+      const next = await api.readEditor(state.activeChat, path);
+      if (request !== editorRequest || files !== editorGroup()) return;
+      file = { ...next, cleanText: next.text, dirty: false };
+      files.set(file.path, file);
+    }
+    showEditor(file, line);
+  } catch (error) { toast(error); }
+}
+
+function closeEditorTab(files, file) {
+  if (file.dirty && !window.confirm('Закрыть «' + file.path + '» без сохранения?')) return;
+  files.delete(file.path);
+  if (editView === file) {
+    hideEditor();
+    const next = [...files.values()].at(-1);
+    if (next) showEditor(next);
+    else void openPreview(file.path, 'files');
+  }
+  renderEditorTabs();
+}
+
+async function saveCurrentFile() {
+  const file = editView;
+  const chatId = state.activeChat;
+  if (!file?.dirty || state.busy || state.workspaceMutation) return;
+  const draft = file.text;
+  try {
+    const result = await api.saveFile(chatId, file.path, file.stamp, draft);
+    if (result.conflict) {
+      if (editView === file && !document.querySelector('dialog[open]')) {
+        editorConflict = { file, result };
+        setText('editor-conflict-diff', result.patch || 'Содержимое совпадает.');
+        $('editor-conflict-dialog').showModal();
+      }
+      return;
+    }
+    file.stamp = result.stamp;
+    file.cleanText = result.text;
+    file.dirty = file.text !== result.text;
+    if (editView === file) renderEditorTabs();
+  } catch (error) { toast(error); }
+}
+
+function openRollback(message) {
+  const dialog = $('rollback-dialog');
+  rollbackTarget = { chatId: message.chatId, id: message.id, request: 0 };
+  $('rollback-file').replaceChildren(...message.managedPaths.map(path => {
+    const option = element('option', '', path);
+    option.value = path;
+    return option;
+  }));
+  dialog.showModal();
+  updateRollbackPreview();
+}
+
+async function updateRollbackPreview() {
+  const target = rollbackTarget;
+  const request = ++target.request;
+  const path = $('rollback-file').value;
+  $('apply-rollback').disabled = true;
+  setText('rollback-status', 'Сравниваем версии…');
+  setText('rollback-diff', '');
+  try {
+    if (editorGroup()?.get(path)?.dirty) throw new Error('Сохраните или закройте черновик этого файла.');
+    const result = await api.rollbackPreview(target.chatId, target.id, path);
+    if (target !== rollbackTarget || request !== target.request || !$('rollback-dialog').open) return;
+    target.preview = result;
+    target.path = path;
+    const detail = result.conflict ? 'Конфликт. Проверьте версии фрагмента.'
+      : result.patch ? 'Предпросмотр изменения рабочего файла.' : 'Правка уже отсутствует в рабочем файле.';
+    setText('rollback-status', detail + (result.staged ? ' Для этого файла также есть изменения в индексе Git.' : ''));
+    setText('rollback-diff', result.conflict ?? result.patch ?? '');
+    $('apply-rollback').disabled = Boolean(result.conflict);
+  } catch (error) {
+    if (target === rollbackTarget && request === target.request) setText('rollback-status', errorText(error));
+  }
+}
+
+async function loadCommit() {
+  const target = commitTarget;
+  $('confirm-commit').disabled = true;
+  try {
+    const info = await api.commitPreview(target.chatId);
+    if (target !== commitTarget || !$('commit-dialog').open) return;
+    target.token = info.token;
+    setText('commit-branch', info.branch + ' · ' + info.repo);
+    setText('commit-paths', info.paths.length ? info.paths.join('\n') : 'В индексе нет изменений.');
+    setText('commit-diff', info.diff).hidden = !info.diff;
+    $('confirm-commit').disabled = !info.paths.length;
+  } catch (error) { setText('commit-error', errorText(error)).hidden = false; }
+}
+
+$('toggle-archive-chat').addEventListener('click', () => {
+  $('chat-actions-dialog').close();
+  void toggleArchive(chatAction);
+});
+$('restore-active-chat').addEventListener('click', () => toggleArchive(activeChat()));
+$('menu-rename-chat').addEventListener('click', () => {
+  $('chat-actions-dialog').close();
+  openRename('chat', chatAction);
+});
+$('request-delete-chat').addEventListener('click', () => {
+  $('chat-actions-dialog').close();
+  setText('delete-chat-name', chatAction.title);
+  $('delete-chat-dialog').showModal();
+});
+$('delete-chat-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = chatAction;
+  try {
+    updateState(await api.deleteChat(target.id));
+    drafts.delete(target.id);
+    draftContexts.delete(target.id);
+    $('delete-chat-dialog').close();
+  } catch (error) { toast(error); }
+});
+$('search-archive').addEventListener('change', searchHistory);
+$('edit-preview').addEventListener('click', () => { if (preview) openEditor(preview.path, preview.line); });
+$('save-file').addEventListener('click', saveCurrentFile);
+$('editor-find').addEventListener('click', () => editor?.search());
+$('editor-line').addEventListener('click', () => editor?.go());
+$('reload-editor').addEventListener('click', () => {
+  const { file, result } = editorConflict;
+  Object.assign(file, { stamp: result.stamp, text: result.text, cleanText: result.text, dirty: false });
+  $('editor-conflict-dialog').close();
+  if (editView === file) showEditor(file);
+});
+window.addEventListener('beforeunload', event => {
+  if ([...editorFiles.values()].some(files => [...files.values()].some(file => file.dirty))) {
+    event.preventDefault();
+    event.returnValue = false;
+  }
+});
+$('rollback-file').addEventListener('change', updateRollbackPreview);
+$('rollback-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = rollbackTarget;
+  if ($('apply-rollback').disabled || !target.preview) return;
+  $('apply-rollback').disabled = true;
+  try {
+    await api.rollback(target.chatId, target.id, target.path, target.preview.token);
+    $('rollback-dialog').close();
+  } catch (error) { setText('rollback-status', errorText(error)); }
+});
+$('stage-file').addEventListener('click', async () => {
+  if (preview?.mode !== 'changes') return;
+  try { await api.stageFile(state.activeChat, preview.path, preview.scope !== 'staged'); }
+  catch (error) { toast(error); }
+});
+$('stage-hunks').addEventListener('click', async () => {
+  if (preview?.mode !== 'changes') return;
+  const { path, scope } = preview;
+  const chatId = state.activeChat;
+  try {
+    const { hunks, token } = await api.gitHunks(chatId, path, scope);
+    if (state.activeChat !== chatId || document.querySelector('dialog[open]')) return;
+    stageTarget = { chatId, path, scope, token };
+    setText('hunks-title', scope === 'staged' ? 'Убрать фрагменты из индекса' : 'Добавить фрагменты в индекс');
+    setText('hunks-path', path);
+    $('hunks-list').replaceChildren(...hunks.map((patch, index) => {
+      const item = element('div', 'hunk-choice');
+      const label = element('label', 'check-label');
+      const control = element('input');
+      control.type = 'checkbox';
+      control.value = index;
+      label.append(control, document.createTextNode(patch.split('\n')[0]));
+      item.append(label, element('pre', 'context-text', patch));
+      return item;
+    }));
+    $('hunks-dialog').showModal();
+  } catch (error) { toast(error); }
+});
+$('hunks-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = stageTarget;
+  const selected = [...$('hunks-list').querySelectorAll('input:checked')].map(input => Number(input.value));
+  if (!selected.length) return;
+  try {
+    await api.stageHunks(target.chatId, target.path, target.scope, selected, target.token);
+    $('hunks-dialog').close();
+  } catch (error) { toast(error); }
+});
+$('open-commit').addEventListener('click', () => {
+  commitTarget = { chatId: state.activeChat, token: null };
+  $('commit-form').reset();
+  setText('commit-branch', 'Читаем индекс Git…');
+  setText('commit-paths', '');
+  $('commit-diff').hidden = true;
+  $('commit-error').hidden = true;
+  $('commit-dialog').showModal();
+  void loadCommit();
+});
+$('commit-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = commitTarget;
+  if (!target.token || $('confirm-commit').disabled) return;
+  $('confirm-commit').disabled = true;
+  $('commit-error').hidden = true;
+  try {
+    const hash = await api.commit(target.chatId, target.token, $('commit-message').value);
+    target.token = null;
+    setText('commit-paths', 'Создан коммит ' + hash);
+    $('commit-diff').hidden = true;
+    $('commit-message').value = '';
+  } catch (error) {
+    setText('commit-error', errorText(error)).hidden = false;
+    await loadCommit();
+  }
+});
+
 api.state().then(updateState).catch(toast);

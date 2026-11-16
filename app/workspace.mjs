@@ -52,10 +52,16 @@ export async function readProjectFile(root, target) {
 }
 
 export function gitIn(root, args, options = {}) {
-  return exec('git', ['--literal-pathspecs', ...args], {
-    cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 2_000_000, ...options,
+  const { input, ...settings } = options;
+  const task = exec('git', ['--literal-pathspecs', ...args], {
+    cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 2_000_000, ...settings,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-  }).then(result => result.stdout);
+  });
+  if (input != null) {
+    task.child.stdin.on('error', () => {});
+    task.child.stdin.end(input);
+  }
+  return task.then(result => result.stdout);
 }
 
 export function gitPrefix(root) {

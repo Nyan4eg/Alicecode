@@ -3,9 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'nonce-alicecode-editor'; img-src 'self';">
   <title>Alicecode</title>
   <link rel="stylesheet" href="styles.css">
+  <script defer src="editor.bundle.js"></script>
   <script defer src="renderer.js"></script>
 </head>
 <body>
@@ -57,6 +58,9 @@
               <button id="allow" class="primary" type="button">Разрешить один раз</button>
             </div>
           </section>
+          <section id="archive-banner" class="permission archive-banner" hidden>
+            <span>Чат в архиве</span><button id="restore-active-chat" class="quiet" type="button">Восстановить</button>
+          </section>
           <form id="composer" class="composer">
             <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" placeholder="Опишите задачу для Алисы…"></textarea>
             <div id="attachments" class="attachments" aria-label="Прикреплённые фрагменты" hidden></div>
@@ -85,17 +89,35 @@
           <button id="changes-tab" type="button" role="tab" aria-selected="false">Изменения <span id="changes-count" hidden></span></button>
           <button id="review-tab" type="button" role="tab" aria-selected="false" hidden>Запуск</button>
         </div>
+        <div id="git-actions" class="git-actions" hidden><button id="open-commit" class="quiet" type="button">Коммит…</button></div>
         <div id="workspace" class="workspace"></div>
+        <div id="editor-tabs" class="editor-tabs" aria-label="Открытые файлы" hidden></div>
         <section id="inline-preview" class="inline-preview" aria-labelledby="preview-title" hidden>
           <div class="preview-heading">
             <div>
               <div id="preview-mode" class="side-label"></div>
               <h2 id="preview-title"></h2>
             </div>
+            <button id="edit-preview" class="quiet context-button" type="button" hidden>Редактировать</button>
             <button id="attach-preview" class="quiet context-button" type="button" title="Добавить файл или строки в контекст" hidden>@</button>
             <button id="close-preview" class="quiet icon" type="button" aria-label="Закрыть просмотр" title="Закрыть просмотр">×</button>
           </div>
+          <div id="preview-git" class="git-actions" hidden>
+            <button id="stage-file" class="quiet" type="button"></button>
+            <button id="stage-hunks" class="quiet" type="button">Выбрать фрагменты…</button>
+          </div>
           <pre id="preview-content" tabindex="0" aria-label="Содержимое файла"></pre>
+        </section>
+        <section id="inline-editor" class="inline-preview" aria-labelledby="editor-title" hidden>
+          <div class="preview-heading">
+            <div><div class="side-label">Редактор</div><h2 id="editor-title"></h2></div>
+            <button id="save-file" class="quiet context-button" type="button" title="Сохранить · Ctrl+S">Сохранить</button>
+          </div>
+          <div class="git-actions">
+            <button id="editor-find" class="quiet" type="button">Найти</button>
+            <button id="editor-line" class="quiet" type="button">К строке</button>
+          </div>
+          <div id="editor-host"></div>
         </section>
       </aside>
     </div>
@@ -128,9 +150,67 @@
     <div class="dialog-header"><h2 id="history-title">Поиск по истории</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
     <input id="history-query" aria-label="Название или фраза" type="search" placeholder="Название или фраза из чата" maxlength="120" autocomplete="off"
       aria-controls="history-results" aria-autocomplete="list" aria-expanded="true" role="combobox">
+    <label class="check-label"><input type="checkbox" id="search-archive">Включить архив</label>
     <div id="history-status" class="muted history-status" role="status">Ищем по всем проектам и чатам.</div>
     <div id="history-results" class="history-results" role="listbox" aria-label="Результаты поиска"></div>
     <div class="history-keys"><kbd>↑</kbd> <kbd>↓</kbd> Выбрать <kbd>Enter</kbd> Открыть <kbd>Esc</kbd> Закрыть</div>
+  </dialog>
+
+  <dialog id="chat-actions-dialog" aria-labelledby="chat-actions-title">
+    <div class="dialog-header"><h2 id="chat-actions-title"></h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <div class="chat-actions-list">
+      <button id="menu-rename-chat" class="quiet" type="button">Переименовать</button>
+      <button id="toggle-archive-chat" class="quiet" type="button"></button>
+      <button id="request-delete-chat" class="quiet danger" type="button">Удалить чат…</button>
+    </div>
+  </dialog>
+
+  <dialog id="delete-chat-dialog" aria-labelledby="delete-chat-title">
+    <form id="delete-chat-form">
+      <div class="dialog-header"><h2 id="delete-chat-title">Удалить чат?</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="delete-chat-name"></p>
+      <p class="muted">История, сохранённые сравнения и локальная сессия этого чата будут удалены.</p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button" autofocus>Отмена</button><button class="primary danger-fill" type="submit">Удалить чат</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="editor-conflict-dialog" class="changes-dialog" aria-labelledby="editor-conflict-title">
+    <div class="dialog-header"><h2 id="editor-conflict-title">Файл изменился на диске</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <p class="muted">Сравнение текущего файла на диске с черновиком.</p>
+    <pre id="editor-conflict-diff" class="context-text" tabindex="0"></pre>
+    <div class="dialog-footer"><button class="quiet close-dialog" type="button">Оставить черновик</button><button id="reload-editor" class="primary" type="button">Загрузить с диска</button></div>
+  </dialog>
+
+  <dialog id="rollback-dialog" class="changes-dialog" aria-labelledby="rollback-title">
+    <form id="rollback-form">
+      <div class="dialog-header"><h2 id="rollback-title">Откатить правки Алисы</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <label for="rollback-file">Файл</label><select id="rollback-file"></select>
+      <p id="rollback-status" class="muted" role="status"></p>
+      <pre id="rollback-diff" class="context-text" tabindex="0"></pre>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="apply-rollback" class="primary" type="submit" disabled>Применить откат</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="hunks-dialog" class="changes-dialog" aria-labelledby="hunks-title">
+    <form id="hunks-form">
+      <div class="dialog-header"><h2 id="hunks-title"></h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="hunks-path" class="muted"></p>
+      <div id="hunks-list"></div>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Применить к индексу</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="commit-dialog" class="changes-dialog" aria-labelledby="commit-title">
+    <form id="commit-form">
+      <div class="dialog-header"><h2 id="commit-title">Создать коммит</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="commit-branch" class="muted"></p>
+      <p id="commit-paths"></p>
+      <pre id="commit-diff" class="context-text" tabindex="0"></pre>
+      <label for="commit-message">Сообщение коммита</label>
+      <textarea id="commit-message" rows="2" required maxlength="4000"></textarea>
+      <p id="commit-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="confirm-commit" class="primary" type="submit">Создать коммит</button></div>
+    </form>
   </dialog>
 
   <dialog id="file-dialog" class="history-dialog" aria-labelledby="file-dialog-title">
