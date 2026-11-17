@@ -57,6 +57,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS project_profiles (projectId TEXT PRIMARY KEY REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS command_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS package_profiles (projectId TEXT NOT NULL REFERENCES projects(id), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(projectId,id));
+      CREATE TABLE IF NOT EXISTS check_files (version TEXT PRIMARY KEY, files TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_workspaces (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, chatId TEXT, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS api_requests (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS project_analysis (root TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -65,10 +67,15 @@ export class Store {
     this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'",
       approval: "TEXT NOT NULL DEFAULT 'ask'", planning: 'INTEGER NOT NULL DEFAULT 0', draftPlan: 'TEXT', workspace: 'TEXT', pins: "TEXT NOT NULL DEFAULT '[]'", summary: 'TEXT' });
     this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'", task: 'TEXT' });
+    this.addColumns('chats', { profileId: "TEXT NOT NULL DEFAULT 'all'" });
     for (const row of this.db.prepare('SELECT id,projectId,workspace FROM chats WHERE workspace IS NOT NULL').all()) {
       this.db.prepare('INSERT OR IGNORE INTO task_workspaces VALUES (?,?,?,?)').run(row.id, row.projectId, row.id, row.workspace);
     }
     for (const run of this.commands().filter(run => ['pending', 'in_progress', 'background'].includes(run.status))) {
+      for (const step of run.steps ?? []) {
+        if (step.status === 'in_progress') step.status = 'interrupted';
+        if (step.status === 'pending') step.status = 'skipped';
+      }
       this.saveCommand({ ...run, status: 'interrupted', error: 'Перезапуск приложения: состояние процесса не подтверждено.', endedAt: Date.now() });
     }
     for (const request of this.requests().filter(item => !['done', 'error', 'cancelled', 'interrupted'].includes(item.phase))) this.saveRequest({ ...request, phase: 'interrupted', reason: 'Запрос прерван перезапуском приложения.' });
@@ -145,6 +152,26 @@ export class Store {
   }
 
   profile(projectId) { return JSON.parse(this.db.prepare('SELECT data FROM project_profiles WHERE projectId=?').get(projectId)?.data ?? '{}'); }
+  profiles(projectId) {
+    return [this.profile(projectId), ...this.db.prepare('SELECT data FROM package_profiles WHERE projectId=? ORDER BY rowid')
+      .all(projectId).map(row => JSON.parse(row.data))];
+  }
+  selectedProfile(chat) {
+    return this.profiles(chat.projectId).find(profile => (profile.id ?? 'all') === chat.profileId) ?? this.profile(chat.projectId);
+  }
+  selectProfile(chatId, id) {
+    const chat = this.chat(chatId);
+    if (!this.profiles(chat.projectId).some(profile => (profile.id ?? 'all') === id)) throw Error('Профиль не найден.');
+    this.db.prepare('UPDATE chats SET profileId=? WHERE id=?').run(id,chatId);
+  }
+  putProfile(chat, profile) {
+    this.transaction(() => {
+      if (profile.id === 'all') this.saveProfile(chat.projectId,profile);
+      else this.db.prepare('INSERT INTO package_profiles VALUES (?,?,?) ON CONFLICT(projectId,id) DO UPDATE SET data=excluded.data')
+        .run(chat.projectId,profile.id,JSON.stringify(profile));
+      this.selectProfile(chat.id,profile.id);
+    });
+  }
   savePins(id, pins) { this.chat(id); this.db.prepare('UPDATE chats SET pins=? WHERE id=?').run(JSON.stringify(pins), id); }
   saveSummary(id, text, through, root, expected = null) {
     const chat = this.chat(id);

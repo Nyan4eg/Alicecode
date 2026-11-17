@@ -53,36 +53,46 @@ async function visitNote(note) {
 function isCheck(run) {
   return run.check || run.tests || ['Тесты', 'Сборка'].includes(run.label) || /^(node --test|npm (test|run build))(\s|$)/.test(run.command);
 }
-function loadVersion(root) {
+function loadVersion(run, key) {
+  const root = run.root;
   const original = state.projects.find(p => p.id === activeChat()?.projectId)?.path;
   if (root !== currentRoot() && root !== original) return;
-  const entry = {};
-  versions.set(root, entry);
-  api.checkVersion(state.activeChat, root === original).then(value => {
-    if (versions.get(root) !== entry) return;
+  const entry = {root};
+  versions.set(key, entry);
+  api.checkVersion(state.activeChat, root === original,run.id).then(value => {
+    if (versions.get(key) !== entry) return;
     entry.value = value; renderWorkflow();
-  }).catch(() => { if (versions.get(root) === entry) { entry.value = null; renderWorkflow(); } });
+  }).catch(() => { if (versions.get(key) === entry) { entry.value = null; renderWorkflow(); } });
 }
 function invalidateVersion(root) {
-  if (!versions.has(root)) return;
+  if (![...versions.values()].some(entry=>entry.root === root)) return;
   clearTimeout(refreshTimers.get(root));
   refreshTimers.set(root, setTimeout(() => {
     refreshTimers.delete(root);
-    versions.delete(root);
+    for (const [key, entry] of versions) if (entry.root === root) versions.delete(key);
     renderWorkflow();
   }, 200));
 }
 api.onChecksChanged(invalidateVersion);
-window.addEventListener('focus', () => { for (const root of versions.keys()) invalidateVersion(root); });
+window.addEventListener('focus', () => { for (const root of new Set([...versions.values()].map(entry=>entry.root))) invalidateVersion(root); });
 function versionBadge(run) {
   let label = 'Версия кода не подтверждена', stale = false;
+  const saved = run.profile;
+  const current = state.profileSets?.[run.projectId]?.find(p => p.id === (saved?.id ?? 'all'));
+  if (saved && current && (current.directory !== saved.directory || current.runtime !== saved.runtime ||
+    JSON.stringify([...current.scope].sort()) !== JSON.stringify([...(saved.scope ?? [])].sort()) ||
+    (run.check && current.commands[run.check] !== (saved.commands?.[run.check] ?? '')))) {
+    return element('span', 'check-version stale', 'Настройки проверки изменились');
+  }
   if (run.version) {
-    if (!versions.has(run.root)) loadVersion(run.root);
-    const entry = versions.get(run.root);
+    const key = JSON.stringify([run.chatId, run.root, run.profile?.scope ?? [], run.version]);
+    if (!versions.has(key)) loadVersion(run,key);
+    const entry = versions.get(key);
     if (entry && !('value' in entry)) label = 'Сверяем файлы…';
     if (entry?.value) {
-      stale = entry.value !== run.version;
+      stale = entry.value.version !== run.version;
       label = stale ? 'Код изменился после проверки' : 'Проверено на текущем коде';
+      if (stale && entry.value.changed) label += ' · ' + entry.value.changed;
     }
   }
   const badge = element('span', stale ? 'check-version stale' : 'check-version', label);
@@ -122,11 +132,11 @@ function renderReviewNotes(host, message, runs) {
   }
   const seen = new Set();
   for (const run of runs.filter(run => isCheck(run) && !runIsActive(run))) {
-    const key = JSON.stringify([run.root, run.command]);
+    const key = JSON.stringify([run.root, run.cwd, run.profile?.id ?? 'all', run.command]);
     if (seen.has(key)) continue;
     seen.add(key);
     const row = element('div', 'review-check');
-    row.append(element('strong', '', run.command + ' · ' + (run.exitCode === 0 ? 'Успешно' : runLabels[run.status])),
+    row.append(element('strong', '', (run.profile?.name ?? 'Весь проект') + ' · ' + run.command + ' · ' + (run.exitCode === 0 ? 'Успешно' : runLabels[run.status])),
       element('small', 'muted', run.cwd), versionBadge(run),
       workflowButton('Повторить', async () => {
         try { mergeCommand(await api.repeatCommand(run.id)); } catch (error) { toast(error); }

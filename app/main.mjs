@@ -28,7 +28,7 @@ import { Attachments } from './attachments.mjs';
 import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
 import { monitoredProvider } from './requests.mjs';
 import { codeQuery } from './code-service.mjs';
-import { checkKind, codeVersion } from './revision.mjs';
+import { checkKind, codeVersion, fileRevision } from './revision.mjs';
 import { inspectFragments, suggestContext, summarize, summaryPrompt } from './conversation-context.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
@@ -90,11 +90,13 @@ function snapshot() {
   const providerSettings = Object.fromEntries([...connections].map(([mode, value]) => [mode, {
     folderId: value.folderId, tokenSource: value.tokenSource, cliProfile: value.cliProfile,
   }]));
+  const saved = store.snapshot(), chat = saved.chats.find(item => item.id === saved.activeChat);
+  const profileSets = Object.fromEntries(saved.projects.map(p => [p.id, store.profiles(p.id).map(commandProfile)]));
   return {
-    ...store.snapshot(), configured: Boolean(credentials), credentialError,
+    ...saved, configured: Boolean(credentials), credentialError, profileSets,
     chatStates: store.workspaceStates('chat'), projectStates: store.workspaceStates('project'),
     editorStates: store.workspaceStates('editor'),
-    projectProfiles: Object.fromEntries(store.snapshot().projects.map(project => [project.id, commandProfile(store.profile(project.id))])),
+    projectProfiles: Object.fromEntries(saved.projects.map(p => [p.id, profileSets[p.id].find(profile => p.id === chat?.projectId && profile.id === chat.profileId) ?? profileSets[p.id][0]])),
     commandRuns: store.commands(), taskWorkspaces: store.taskWorkspaces(),
     reviewNotes: store.notes(store.setting('activeChat') ?? ''),
     apiRequests: store.requests(), analyses: store.analyses(),
@@ -271,7 +273,7 @@ async function requestPermission(turn, params) {
     return optionId ? { outcome: { outcome: 'selected', optionId } } : cancelledPermission();
   });
   if (decision?.outcome?.optionId === permit.optionId && checkKind(details.command, turn.message.task?.profile)) {
-    turn.checkVersions.set(details.id, await codeVersion(turn.cwd));
+    turn.checkVersions.set(details.id, await commands.fingerprint(turn.cwd, turn.message.task.profile));
   }
   return decision;
 }
@@ -416,7 +418,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null, r
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
   const instructionSnapshot = resume?.instructions ?? await projectInstructions(chat.cwd);
-  const profile = commandProfile(store.profile(chat.projectId));
+  const profile = commandProfile(resume?.profile ?? store.selectedProfile(chat));
   const commandEnv = chat.mode === 'code' ? await commandEnvironment(profile) : null;
   assertIdle();
   const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot, profile, summary: chat.summary,
@@ -551,7 +553,8 @@ async function replay(chatId, messageId, toolId, confirmedDirectory) {
     if (turn.stop) return;
     turn.stage = 'test';
     emit('app:state', snapshot());
-    turn.checkVersions = new Map([[tool.id, await codeVersion(chat.cwd)]]);
+    turn.replayProfile = store.command('agent:' + messageId + ':' + toolId)?.profile;
+    turn.checkVersions = new Map([[tool.id, await commands.fingerprint(chat.cwd,turn.replayProfile)]]);
     const { error, ...result } = await runTest(details, turn.abort.signal);
     Object.assign(tool, result, { status: error ? 'failed' : 'completed', tests: nodeTestCounts(result.output),
       repeatable: !result.interrupted && Number.isInteger(result.exitCode) });
@@ -753,12 +756,15 @@ if (!app.requestSingleInstanceLock()) {
     };
     bind('project:commands', (id, value) => {
       const chat = taskChat(id); if (active?.chatId === id) throw new Error('Завершите задачу перед изменением команд.');
-      store.saveProfile(chat.projectId, commandProfile(value)); return snapshot();
+      store.putProfile(chat, commandProfile(value)); return snapshot();
+    });
+    bind('command:profile', (id, profileId) => {
+      taskChat(id); store.selectProfile(id, profileId); return snapshot();
     });
     bind('command:start', async (id, key, original = false) => {
       const chat = taskChat(id);
-      const run = await commands.start({ chatId: id, projectId: chat.projectId, root: original ? chat.projectCwd : chat.cwd, profile: store.profile(chat.projectId), key });
-      return run;
+      const details = { chatId: id, projectId: chat.projectId, root: original ? chat.projectCwd : chat.cwd, profile: store.selectedProfile(chat), key };
+      return key === 'sequence' ? commands.sequence(details) : commands.start(details);
     });
     bind('command:stop', id => {
       const run = store.command(id); if (!run) throw new Error('Команда не найдена.');
@@ -771,8 +777,9 @@ if (!app.requestSingleInstanceLock()) {
       const run = store.command(id); if (!run || ['pending', 'in_progress', 'background'].includes(run.status)) throw new Error('Команда ещё выполняется.');
       const chat = taskChat(run.chatId);
       const root = await realpath(run.root);
+      if (run.steps) return commands.sequence({ chatId: chat.id, projectId: chat.projectId, root, profile: run.profile });
       const cwd = relative(root, await realpath(run.cwd)).replaceAll('\\', '/');
-      return commands.start({ chatId: chat.id, projectId: chat.projectId, root, cwd: cwd || '.', command: run.command, profile: run.profile ?? store.profile(chat.projectId) });
+      return commands.start({ chatId: chat.id, projectId: chat.projectId, root, cwd: cwd || '.', command: run.command, key: run.check, profile: run.profile ?? store.profile(chat.projectId) });
     });
     bind('workspace:list', async () => Promise.all(store.taskWorkspaces().map(async workspace => {
       try {
@@ -926,10 +933,23 @@ if (!app.requestSingleInstanceLock()) {
         '\nФрагмент:\n' + note.anchor.snippet + '\nЗамечание: ' + note.body)].join('\n\n');
       await send(chatId, prompt, [], [], null, notes.map(note => note.id));
     });
-    bind('checks:version', async (chatId, original) => {
+    bind('checks:version', async (chatId, original, runId) => {
       const chat = store.chat(chatId), root = original ? chat.projectCwd : chat.cwd;
       watchAnalysis(root);
-      return codeVersion(root);
+      if (!runId) return codeVersion(root);
+      const run = store.command(runId);
+      if (run?.chatId !== chatId || run.root !== root) return null;
+      const now = await fileRevision(root,run.profile?.scope);
+      if (!now) return null;
+      let changed;
+      if (now.version !== run.version) {
+        const saved = store.db.prepare('SELECT files FROM check_files WHERE version=?').get(run.version);
+        if (saved) {
+          const prior = new Map(JSON.parse(saved.files)), current = new Map(now.files);
+          changed = [...new Set([...prior.keys(), ...current.keys()])].find(path => prior.get(path) !== current.get(path));
+        }
+      }
+      return { version: now.version, changed };
     });
     bind('chat:rollback-preview', async (chatId, messageId, path) => {
       const { root, result } = await rollbackDetails(chatId, messageId, path);

@@ -4,6 +4,7 @@ import { gitIn, projectEntry } from './workspace.mjs';
 import { testInvocation } from './replay.mjs';
 
 export function checkKind(command, profile, key) {
+  if (key === 'types' || command && command === profile?.commands?.types) return 'types';
   if (key === 'test' || key === 'build') return key;
   if (!command) return null;
   if (command === profile?.commands?.test || testInvocation(command)) return 'test';
@@ -13,11 +14,16 @@ export function checkKind(command, profile, key) {
 
 // Hash saved working files, including untracked sources. Staging alone does not change the version.
 export async function codeVersion(root) {
+  return (await fileRevision(root))?.version ?? null;
+}
+
+export async function fileRevision(root, scope = []) {
   try {
-    const listing = await gitIn(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '.']);
+    const listing = await gitIn(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...(scope.length ? scope : ['.'])]);
     const paths = [...new Set(listing.split('\0').filter(Boolean))].sort();
     if (paths.length > 5000) return null;
     const digest = createHash('sha256');
+    const files = [];
     let total = 0;
     for (const path of paths) {
       let file;
@@ -27,9 +33,11 @@ export async function codeVersion(root) {
       total += info.size;
       if (!info.isFile() || total > 64 * 1024 * 1024 || info.size > 8 * 1024 * 1024) return null;
       const bytes = await readFile(file);
-      digest.update(path).update('\0').update(createHash('sha256').update(bytes).digest());
+      const hash = createHash('sha256').update(bytes).digest();
+      files.push([path, hash.toString('hex')]);
+      digest.update(path).update('\0').update(hash);
     }
-    return digest.digest('hex');
+    return { version: digest.digest('hex'), files };
   } catch { return null; }
 }
 

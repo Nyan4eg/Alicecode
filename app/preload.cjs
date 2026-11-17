@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('alicecode', {
   saveSummary: invoke('context:save-summary'),
   saveProjectCommands: invoke('project:commands'),
   startCommand: invoke('command:start'),
+  selectCommandProfile: invoke('command:profile'),
   stopCommand: invoke('command:stop'),
   repeatCommand: invoke('command:repeat'),
   onCommand: subscribe('command:run'),

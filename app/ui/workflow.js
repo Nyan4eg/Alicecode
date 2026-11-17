@@ -1,5 +1,5 @@
 'use strict';
-const projectCommandLabels = { prepare: 'Подготовить ветку', install: 'Зависимости', test: 'Тесты', build: 'Сборка', start: 'Запустить' };
+const projectCommandLabels = { prepare: 'Подготовить ветку', install: 'Зависимости', types: 'Типы', test: 'Тесты', build: 'Сборка', start: 'Запустить' };
 let workflowMode = null, workflowTaskId = null, selectedCommandId = null, commandOriginal = false, commandSettingsTarget;
 const runLabels = { pending: 'Ожидает', in_progress: 'Выполняется', background: 'В фоне', completed: 'Готово', failed: 'Ошибка', interrupted: 'Прервано' };
 function workflowView() { return { mode: workflowMode, messageId: workflowTaskId, commandId: selectedCommandId, original: commandOriginal }; }
@@ -9,6 +9,24 @@ function workflowButton(label, action, className = 'quiet') { const b = element(
 function currentRoot(chat = activeChat()) { return chat?.workspace?.root ?? state.projects.find(p => p.id === chat?.projectId)?.path; }
 function selectedCommand() { return state?.commandRuns?.find(run => run.id === selectedCommandId); }
 function runIsActive(run) { return ['pending', 'in_progress', 'background'].includes(run.status); }
+function profileControls(chat, original) {
+  const host = element('div', 'profile-controls');
+  const picker = element('select'); picker.setAttribute('aria-label','Профиль команд');
+  for (const profile of state.profileSets[chat.projectId]) picker.add(new Option(profile.name, profile.id));
+  picker.value = chat.profileId;
+  picker.addEventListener('change', async () => {
+    try { updateState(await api.selectCommandProfile(chat.id, picker.value)); } catch (error) { toast(error); }
+  });
+  const check = workflowButton('Проверить задачу', async () => {
+    check.disabled = true;
+    try { const run = await api.startCommand(chat.id, 'sequence', original); selectedCommandId = run.id; mergeCommand(run); openWorkflow('commands'); }
+    catch (error) { toast(error); check.disabled = false; }
+  });
+  check.disabled = !state.projectProfiles[chat.projectId]?.sequence.length || state.commandRuns.some(run => run.chatId === chat.id && run.steps && runIsActive(run));
+  check.title = original ? 'В исходной папке' : 'В рабочей папке чата';
+  host.append(picker, check, workflowButton('Новый профиль', () => openCommandSettings(true)));
+  return host;
+}
 function renderWorkflow() {
   if (!state) return;
   const chat = activeChat(), runs = (state.commandRuns ?? []).filter(run => run.chatId === chat?.id);
@@ -25,6 +43,19 @@ function renderWorkflow() {
   setText('drawer-caption', chat?.workspace ? chat.workspace.branch : 'Исходная папка');
   if (workflowMode === 'task') {
     const host = $('task-overview'); host.replaceChildren();
+    if (chat) host.append(profileControls(chat,false));
+    const latest = runs.find(run => run.steps && run.profile?.id === chat?.profileId);
+    if (latest) {
+      const steps = element('div','profile-controls');
+      steps.append(element('strong','',latest.profile.name + ' · ' + runLabels[latest.status]));
+      for (const step of latest.steps) {
+        const button = workflowButton(projectCommandLabels[step.key] + ' · ' + (runLabels[step.status] ?? 'Пропущено'), () => {
+          selectedCommandId = step.runId; openWorkflow('commands');
+        });
+        button.disabled = !step.runId; steps.append(button);
+      }
+      steps.title = latest.cwd; host.append(steps);
+    }
     if (!message) { host.append(element('p', 'muted', 'Поставьте задачу Алисе. Здесь появятся план, изменённые файлы и результаты проверок.')); return; }
     const plan = renderTask(message, true); host.append(plan);
     const results = element('div', 'task-results');
@@ -49,8 +80,9 @@ function renderWorkflow() {
 function renderCommandConsole(runs) {
   const chat = activeChat(), profile = state.projectProfiles?.[chat.projectId] ?? { commands: {} };
   const launchers = $('command-launchers'); launchers.replaceChildren();
+  launchers.append(profileControls(chat,commandOriginal));
   const location = element('label', 'check-label'); const checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = commandOriginal;
-  checkbox.addEventListener('change', () => { commandOriginal = checkbox.checked; scheduleWorkspaceSave(); });
+  checkbox.addEventListener('change', () => { commandOriginal = checkbox.checked; renderWorkflow(); scheduleWorkspaceSave(); });
   if (chat.workspace) { location.append(checkbox, document.createTextNode('В исходной папке')); launchers.append(location); }
   for (const [key, label] of Object.entries(projectCommandLabels)) if (profile.commands[key]) {
     const button = workflowButton(label, async () => {
@@ -64,7 +96,7 @@ function renderCommandConsole(runs) {
   if (!runs.some(run => run.id === selectedCommandId)) selectedCommandId = runs[0]?.id;
   for (const run of runs.slice(0, 100)) {
     const row = workflowButton('', () => { selectedCommandId = run.id; renderCommandConsole(runs); scheduleWorkspaceSave(); }, 'command-item' + (run.id === selectedCommandId ? ' selected' : ''));
-    row.append(element('span', 'run-state run-' + run.status, runLabels[run.status] ?? run.status), element('span', 'command-name', run.command)); row.title = run.cwd; $('command-history').append(row);
+    row.append(element('span', 'run-state run-' + run.status, runLabels[run.status] ?? run.status), element('span', 'command-name', (run.profile?.name ? run.profile.name + ' · ' : '') + run.command)); row.title = run.cwd; $('command-history').append(row);
   }
   const run = runs.find(run => run.id === selectedCommandId);
   const heading = $('command-heading'); heading.replaceChildren(); $('command-links').replaceChildren();
@@ -79,6 +111,12 @@ function renderCommandConsole(runs) {
     $('prompt').dispatchEvent(new Event('input', { bubbles: true })); $('prompt').focus();
   }));
   setText('command-location', run.cwd + ' · ' + (run.source === 'agent' ? 'Алиса' : 'Команда проекта') + (run.error ? ' · ' + run.error : ''));
+  for (const step of run.steps ?? []) {
+    const button = workflowButton(projectCommandLabels[step.key] + ' · ' + (runLabels[step.status] ?? 'Пропущено'), () => {
+      selectedCommandId = step.runId; renderCommandConsole(runs);
+    });
+    button.disabled = !step.runId; $('command-links').append(button);
+  }
   if (typeof versionBadge === 'function' && isCheck(run)) heading.append(versionBadge(run));
   const output = $('command-output'), atEnd = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
   output.textContent = (run.truncated ? '… Начало вывода сокращено\n' : '') + run.output;
@@ -87,7 +125,9 @@ function renderCommandConsole(runs) {
   for (const match of run.output.matchAll(/(?:file:\/\/\/)?((?:[A-Za-z]:[\\/]|(?:src|test|tests|app|pages|lib|components)[\\/])[^\s():]+):(\d+)(?::\d+)?/g)) {
     let path = match[1]; try { path = decodeURIComponent(path); } catch {}
     path = path.replaceAll('\\', '/'); const root = run.root.replaceAll('\\', '/');
-    if (/^[a-z]:/i.test(path)) { if (!path.toLowerCase().startsWith(root.toLowerCase() + '/')) continue; path = path.slice(root.length + 1); }
+    if (!/^[a-z]:/i.test(path) && !path.startsWith('/')) path = run.cwd.replaceAll('\\','/').replace(/\/$/,'') + '/' + path;
+    if (!path.toLowerCase().startsWith(root.toLowerCase() + '/')) continue;
+    path = path.slice(root.length + 1);
     const key = path + ':' + match[2]; if (linked.has(key) || linked.size > 12) continue; linked.add(key);
     $('command-links').append(workflowButton(key, () => {
       if (currentRoot()?.toLowerCase() !== run.root.toLowerCase()) return toast('Файл относится к другой рабочей папке задачи.');
@@ -110,21 +150,33 @@ $('close-drawer').addEventListener('click', () => openWorkflow(null));
 document.addEventListener('keydown', event => {
   if (event.ctrlKey && event.code === 'Backquote' && !document.querySelector('dialog[open]')) { event.preventDefault(); openWorkflow(workflowMode === 'commands' ? null : 'commands'); }
 });
-function openCommandSettings() {
+function openCommandSettings(create = false) {
   const chat = activeChat(); if (!chat || document.querySelector('dialog[open]')) return;
-  commandSettingsTarget = { chatId: chat.id }; const profile = state.projectProfiles?.[chat.projectId] ?? { commands: {} };
+  const profile = create === true ? { id: crypto.randomUUID(), commands: {} } : state.projectProfiles[chat.projectId];
+  commandSettingsTarget = { chatId: chat.id, id: profile.id };
+  $('profile-name').value = profile.name ?? ''; $('profile-name').readOnly = profile.id === 'all';
+  $('profile-scope').value = (profile.scope ?? []).join('\n');
+  $('profile-sequence').replaceChildren(...[0,1,2].map(i => {
+    const select = element('select'); select.setAttribute('aria-label','Шаг ' + (i+1));
+    select.add(new Option('—',''));
+    for (const key of ['types','test','build']) select.add(new Option(projectCommandLabels[key],key));
+    select.value = profile.sequence?.[i] ?? ''; return select;
+  }));
   $('command-directory').value = profile.directory ?? ''; $('command-runtime').value = profile.runtime ?? '';
   $('command-settings-fields').replaceChildren();
   for (const [key, label] of Object.entries(projectCommandLabels)) {
     const row = element('label', 'command-setting', label); const input = element('input'); input.id = 'project-command-' + key; input.value = profile.commands[key] ?? ''; input.maxLength = 3000;
-    input.placeholder = ({ prepare: 'npm ci', install: 'npm ci', test: 'npm test', build: 'npm run build', start: 'npm start' })[key]; row.append(input); $('command-settings-fields').append(row);
+    input.placeholder = ({ prepare: 'npm ci', install: 'npm ci', types: 'npm run typecheck', test: 'npm test', build: 'npm run build', start: 'npm start' })[key]; row.append(input); $('command-settings-fields').append(row);
   }
   $('commands-error').hidden = true; $('commands-dialog').showModal();
 }
 $('project-command-settings').addEventListener('click', openCommandSettings);
 $('commands-form').addEventListener('submit', async event => {
   event.preventDefault(); const value = { directory: $('command-directory').value, runtime: $('command-runtime').value,
+    id: commandSettingsTarget.id, name: $('profile-name').value, scope: $('profile-scope').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),
     commands: Object.fromEntries(Object.keys(projectCommandLabels).map(key => [key, $('project-command-' + key).value])) };
+  const steps = [...$('profile-sequence').children].map(select=>select.value).filter(Boolean);
+  if (steps.length) value.sequence = steps;
   try { updateState(await api.saveProjectCommands(commandSettingsTarget.chatId, value)); $('commands-dialog').close(); }
   catch (error) { setText('commands-error', errorText(error)).hidden = false; }
 });

@@ -184,9 +184,10 @@
 
   <dialog id="commands-dialog" class="changes-dialog" aria-labelledby="commands-title">
     <form id="commands-form"><div class="dialog-header"><h2 id="commands-title">Команды проекта</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
-      <p class="muted">Настройки общие для чатов проекта. Команды выполняются в выбранной рабочей папке; отдельная ветка использует свою копию проекта. Алиса получает эти команды как контекст задачи.</p>
+      <label>Название профиля<input id="profile-name" required maxlength="60"></label>
       <div class="profile-environment"><label>Рабочая папка внутри проекта<input id="command-directory" placeholder="Например, backend или ."></label><label>Путь к интерпретатору<input id="command-runtime" placeholder="Необязательно: C:\\Program Files\\nodejs\\node.exe"></label></div>
-      <p class="muted">Каталог выбранного интерпретатора добавляется в начало PATH. В Windows команды выполняются через PowerShell. Команда подготовки ветки запускается кнопкой «Подготовить ветку».</p>
+      <label>Файлы и папки для актуальности проверок<textarea id="profile-scope" rows="2" placeholder="По одному пути от корня проекта в строке. Пусто — весь проект."></textarea></label>
+      <fieldset><legend>Порядок шагов «Проверить задачу»</legend><div id="profile-sequence"></div><small>По умолчанию выполняются настроенные типы, тесты и сборка.</small></fieldset>
       <div id="command-settings-fields"></div><p id="commands-error" class="error" hidden></p>
       <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Сохранить команды</button></div>
     </form>

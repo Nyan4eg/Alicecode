@@ -5,6 +5,33 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store } from '../app/store.mjs';
 import { CommandRuns, commandProfile, commandDirectory } from '../app/project-commands.mjs';
+import { fileRevision } from '../app/revision.mjs';
+import { execFileSync } from 'node:child_process';
+
+test('package profiles migrate lazily, persist per chat and hash only their Git-visible inputs', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'alicecode-scopes-'));
+  const store = new Store(':memory:');
+  t.after(async () => { store.db.close(); await rm(root,{recursive:true,force:true}); });
+  execFileSync('git',['init','-q'],{cwd:root});
+  for (const dir of ['api','web','shared']) await mkdir(join(root,dir));
+  const chat = store.addProject('Packages',root);
+  store.saveProfile(chat.projectId,{directory:'web',commands:{test:'node --test'}});
+  assert.equal(commandProfile(store.selectedProfile(store.chat(chat.id))).name,'Весь проект');
+  const api = commandProfile({id:'api',name:'API',directory:'api',scope:['api/','shared','lock.json']});
+  store.putProfile(chat,api);
+  assert.deepEqual(store.selectedProfile(store.chat(chat.id)),api);
+  const other = store.addChat(chat.projectId);
+  assert.equal(store.chat(other.id).profileId,'all');
+  assert.throws(()=>commandProfile({scope:['../outside']}));
+  const hash = async scope => (await fileRevision(root,scope)).version;
+  const first = await hash(api.scope);
+  await writeFile(join(root,'web','app.css'),'body{}');
+  assert.equal(await hash(api.scope),first);
+  await writeFile(join(root,'shared','types.ts'),'export type Id = string');
+  assert.notEqual(await hash(api.scope),first);
+  await rm(join(root,'shared','types.ts'));
+  assert.equal(await hash(api.scope),first);
+});
 
 async function until(check) { for (let i = 0; i < 200; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 30)); } throw new Error('Timeout'); }
 const quote = text => "'" + text.replaceAll("'", "''") + "'";
