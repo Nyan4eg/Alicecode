@@ -5,8 +5,21 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { consent } from '../app/permissions.mjs';
 import { projectInstructions, saveInstructions } from '../app/instructions.mjs';
-import { finishStep, validatePlan } from '../app/task-plan.mjs';
+import { finishStep, validatePlan, generatePlan } from '../app/task-plan.mjs';
 import { Store } from '../app/store.mjs';
+
+test('plan generation retries a truncated reasoning answer and rejects an incomplete plan', async () => {
+  const budgets = [];
+  const provider = { request: async (_path, options) => {
+    budgets.push(JSON.parse(options.body).max_tokens);
+    return { response: Response.json({ choices: [{ finish_reason: budgets.length === 1 ? 'length' : 'stop',
+      message: { content: budgets.length === 1 ? '' : 'План:\n```json\n{"steps":[{"title":"Run tests","kind":"test"}]}\n```' } }] }), redact: text => text };
+  } };
+  const plan = await generatePlan(provider, 'model', 'folder', 'task', { text: '' }, new AbortController().signal);
+  assert.deepEqual(budgets, [2500, 6000]); assert.equal(plan.steps[0].kind, 'test');
+  provider.request = async () => ({ response: Response.json({ choices: [{ finish_reason: 'length', message: { content: '{"steps":["partial"]}' } }] }), redact: text => text });
+  await assert.rejects(generatePlan(provider, 'model', 'folder', 'task', { text: '' }, new AbortController().signal), /полный план/);
+});
 
 test('Bypass automatically approves every offered tool action without creating any approval queue', async () => {
   const turn = { mode: 'code', approval: 'bypass', permissions: [], stop: false };
