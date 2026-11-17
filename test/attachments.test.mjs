@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, toNamespacedPath } from 'node:path';
 import test from 'node:test';
@@ -13,8 +13,11 @@ test('external folders expose just selected read-only snapshots to the associate
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = join(root, 'project');
   const refs = join(root, 'refs');
-  const store = join(root, 'snapshots');
-  await Promise.all([mkdir(project), mkdir(join(refs, 'logs'), { recursive: true }), mkdir(join(refs, '.git'), { recursive: true })]);
+  const profile = join(root, 'profile');
+  const alias = join(root, 'profile-alias');
+  await Promise.all([mkdir(project), mkdir(profile), mkdir(join(refs, 'logs'), { recursive: true }),
+    mkdir(join(refs, '.git'), { recursive: true })]);
+  await symlink(profile, alias, process.platform === 'win32' ? 'junction' : 'dir');
   const log = join(refs, 'logs', 'qa.log');
   const long = 'diagnostic row \n'.repeat(1_200) + 'LOG-UNIQUE\n';
   await Promise.all([writeFile(log, long), writeFile(join(refs, 'spec.md'), 'approved requirements'),
@@ -22,7 +25,7 @@ test('external folders expose just selected read-only snapshots to the associate
 
   const chat = randomUUID();
   const other = randomUUID();
-  const vault = new Attachments(store);
+  const vault = await Attachments.open(join(alias, 'snapshots'));
   const choice = await vault.choose(chat, [refs]);
   assert.equal(choice.items.length, 3);
   assert.ok(choice.items.every(item => !item.individual && !('absolute' in item)));

@@ -536,7 +536,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
-    attachments = new Attachments(join(app.getPath('userData'), 'context-files'));
+    attachments = await Attachments.open(join(app.getPath('userData'), 'context-files'));
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);

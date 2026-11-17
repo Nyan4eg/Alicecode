@@ -36,8 +36,15 @@ export class Attachments {
   picker = null;
   drafts = new Map();
 
-  constructor(root) {
-    this.home = resolve(root);
+  constructor(home, originalHome) {
+    this.home = home;
+    this.originalHome = originalHome;
+  }
+
+  static async open(root) {
+    const original = resolve(root);
+    const parent = await realpath(dirname(original));
+    return new Attachments(join(parent, basename(original)), original);
   }
 
   async choose(chatId, input) {
@@ -152,6 +159,7 @@ export class Attachments {
     for (const item of files) {
       const path = this.path(chatId, item);
       await mkdir(dirname(path), { recursive: true });
+      if (relative(dirname(path), await realpath(dirname(path)))) throw new Error('Папка вложений изменилась.');
       try { await writeFile(path, item.text, { encoding: 'utf8', flag: 'wx', mode: 0o444 }); }
       catch (error) {
         if (error.code !== 'EEXIST' || (await readText(path, path)).text !== item.text) throw error;
@@ -188,7 +196,8 @@ export class Attachments {
   isSnapshot(target, cwd) {
     if (typeof target !== 'string') return false;
     const path = target.replace(/^\\\\\?\\(?=[a-z]:\\)/i, '').replace(/^\\\\\?\\UNC\\/i, '\\\\');
-    return Boolean(projectPath(this.home, resolve(cwd, path)));
+    const full = resolve(cwd, path);
+    return Boolean(projectPath(this.home, full) || projectPath(this.originalHome, full));
   }
 
   async removeChat(chatId) {
