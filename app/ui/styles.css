@@ -11,6 +11,37 @@
   --white: #fff;
   --code: "Cascadia Code", "Consolas", monospace;
 }
+.taskbar { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 8px; flex-shrink: 0; padding: 6px 18px; border-bottom: 1px solid var(--line); background: #fefcff; font-size: 11px; }
+.taskbar button { font-size: 11px; padding: 5px 7px; color: #6e528f; }
+#task-location { flex: 1; min-width: 80px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.composer-mode-row { flex-wrap: wrap; }
+.composer-mode-row .plan-toggle { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; white-space: nowrap; }
+.plan-toggle input { width: auto; accent-color: var(--accent); }
+#approval-mode { max-width: 170px; }
+.composer.bypass-active { border-color: #ceb17c; }
+.bypass-badge, .auto-decision { background: #faf0dc; color: #87621e; border: 1px solid #eddab2; border-radius: 5px; font-size: 10px; padding: 1px 5px; }
+.task-card { border: 1px solid #e3dbef; background: #fdfbff; border-radius: 12px; padding: 10px 12px; margin: 8px 0 12px; }
+.task-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; font-size: 12px; }
+.task-branch-label { color: var(--muted); font: 11px var(--code); }
+.task-steps { list-style: none; padding: 0; margin: 9px 0 0; }
+.task-step { position: relative; border-top: 1px solid #eee8f5; padding: 8px 0; font-size: 12px; }
+.step-state { display: inline-block; min-width: 83px; margin-right: 7px; color: var(--muted); font-size: 10px; }
+.step-done .step-state { color: #287751; } .step-running .step-state { color: #7750b4; font-weight: 700; }
+.step-error .step-state { color: #a44453; } .step-stopped .step-state { color: #927331; }
+.task-step small { display: block; margin: 4px 0 0 90px; color: var(--muted); }
+.step-evidence { margin: 5px 0 0 90px; color: var(--muted); overflow-wrap: anywhere; font-size: 11px; }
+.step-evidence summary { cursor: pointer; } .step-evidence div { padding: 3px 0; }
+.task-instructions { font-size: 10px; margin-top: 3px; color: var(--muted); }
+.draft-plan-card { max-width: 804px; margin: 0 auto 9px; border: 1px solid #e2d8ef; border-radius: 10px; padding: 8px 12px; background: #fff; font-size: 12px; }
+.draft-plan-card summary { color: #735099; cursor: pointer; }
+.draft-plan-card ol { margin: 8px 0; padding-left: 22px; max-height: 130px; overflow: auto; }
+.plan-editor-row { display: flex; gap: 6px; margin: 7px 0; align-items: center; }
+.plan-editor-row input { min-width: 0; flex: 1; } .plan-editor-row select { width: 115px; padding: 8px 4px; border: 1px solid var(--line); border-radius: 7px; }
+#instructions-text { min-height: 240px; max-height: 48vh; border: 1px solid var(--line); border-radius: 8px; font: 12px/1.6 var(--code); padding: 12px; background: #fcfaff; }
+#transfer-files { max-height: 50vh; overflow: auto; }
+.transfer-file { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.transfer-file summary { cursor: pointer; overflow-wrap: anywhere; }
+@container (max-width: 475px) { #mode-note { display: none; } .composer-mode-row { gap: 6px; } #approval-mode { max-width: 140px; } }
 .composer-mode-row { display: flex; align-items: center; gap: 9px; padding: 10px 15px 0; color: var(--muted); font-size: 11px; }
 .composer-mode-row select { border: 1px solid #e7def2; background: #f6f1fc; color: #604493; border-radius: 7px; padding: 4px 7px; font-size: 11px; max-width: 150px; }
 .composer-mode-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -148,7 +179,13 @@ h1 { font-size: 31px; line-height: 1.15; letter-spacing: -1.3px; margin: 22px 0 
 .tool-list summary .outcome { float: right; margin-left: 6px; }
 .tool-output { max-height: 245px; margin: 0 7px 7px; }
 .busy-text { color: var(--muted); font-size: 13px; }
-.composer-area { padding: 12px 24px 14px; position: relative; flex: 0 0 auto; max-height: calc(100% - 70px); overflow-y: auto; container-type: inline-size; }
+.composer-area { display: flex; flex-direction: column; padding: 12px 24px 14px; position: relative; flex: 0 0 auto; max-height: calc(100% - 70px); overflow-y: auto; container-type: inline-size; }
+.composer-area > .composer, .composer-area > .compose-hint, .composer-area > .notice, .composer-area > .archive-banner { width: 100%; flex-shrink: 0; }
+.composer-area > .draft-plan-card { width: 100%; min-height: 38px; flex: 0 1 auto; overflow: auto; }
+#permission { width: 100%; min-height: 84px; flex: 0 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+#permission .permission-details { min-height: 0; flex: 1; }
+#permission h2, #permission .permission-actions { flex-shrink: 0; }
+.composer-area:has(#permission:not([hidden])) #prompt { min-height: 54px; max-height: 90px; }
 .composer, .permission { max-width: 804px; margin: 0 auto; background: #fff; border: 1px solid #dcd4e7; border-radius: 15px; box-shadow: 0 7px 22px #2b154708; }
 .composer { border-color: #e2daef; border-radius: 20px; background: linear-gradient(165deg, #fff 65%, #fcfaff);
   box-shadow: 0 8px 30px #49277b09, 0 2px 5px #49277b04; transition: border-color .15s, box-shadow .15s; overflow: hidden; }

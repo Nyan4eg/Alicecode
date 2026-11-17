@@ -39,6 +39,12 @@
         <button id="toggle-inspector" class="quiet icon" type="button" title="Панель файлов · Ctrl+Shift+E" aria-label="Панель файлов" aria-keyshortcuts="Control+Shift+e" aria-expanded="true">◫</button>
       </div>
     </header>
+    <div id="taskbar" class="taskbar" hidden>
+      <button id="project-instructions" class="quiet" type="button">Инструкции проекта</button>
+      <button id="create-task-branch" class="quiet" type="button">Отдельная ветка…</button>
+      <button id="transfer-task" class="quiet" type="button" hidden>Перенести результат…</button>
+      <span id="task-location"></span>
+    </div>
     <div class="panes">
       <section class="conversation" aria-label="Чат">
         <div id="thread" class="thread">
@@ -50,6 +56,7 @@
           <div id="messages" class="messages"></div>
         </div>
         <div id="composer-area" class="composer-area" hidden>
+          <details id="draft-plan-card" class="draft-plan-card" hidden><summary>План задачи</summary><ol id="draft-plan-steps"></ol><button id="edit-draft-plan" class="quiet" type="button">Изменить план…</button></details>
           <section id="permission" class="permission" aria-labelledby="permission-title" hidden>
             <h2 id="permission-title" aria-live="polite"></h2>
             <div id="permission-details" class="permission-details"></div>
@@ -64,6 +71,8 @@
           <form id="composer" class="composer">
             <div class="composer-mode-row">
               <select id="chat-mode" aria-label="Режим работы Алисы"><option value="code">Изменить код</option><option value="discuss">Обсудить</option></select>
+              <select id="approval-mode" aria-label="Подтверждения действий" title="Bypass автоматически одобряет все действия агента"><option value="ask">Запрашивать</option><option value="bypass">Bypass · всё</option></select>
+              <label class="plan-toggle"><input id="use-plan" type="checkbox">С планом</label>
               <span id="mode-note">Правки и команды — с разрешения</span>
             </div>
             <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" aria-describedby="compose-hint" placeholder="Что нужно сделать в проекте?"></textarea>
@@ -79,6 +88,7 @@
                 <button id="attach-folder" class="composer-action" type="button" title="Выбрать файлы из папки" aria-label="Выбрать файлы из папки">
                   <span class="composer-icon folder-symbol" aria-hidden="true"></span><span class="composer-action-label">Папка</span>
                 </button>
+                <button id="prepare-plan" class="composer-action" type="button" title="Составить или изменить план" aria-label="Составить или изменить план"><span class="composer-icon" aria-hidden="true">☷</span><span class="composer-action-label">План</span></button>
               </div>
               <div class="composer-submit">
                 <button id="stop" class="quiet" type="button" hidden><span class="stop-symbol" aria-hidden="true"></span>Остановить</button>
@@ -148,6 +158,31 @@
       </aside>
     </div>
   </main>
+
+  <dialog id="instructions-dialog" class="changes-dialog" aria-labelledby="instructions-title">
+    <form id="instructions-form"><div class="dialog-header"><h2 id="instructions-title">Инструкции проекта</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="instructions-note" class="muted"></p><textarea id="instructions-text" aria-label="AGENTS.md" maxlength="32000" rows="12" spellcheck="false"></textarea>
+      <p id="instructions-error" class="error" role="alert" hidden></p><div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="save-instructions" class="primary" type="submit">Сохранить AGENTS.md</button></div>
+    </form>
+  </dialog>
+  <dialog id="task-plan-dialog" class="changes-dialog" aria-labelledby="task-plan-title">
+    <form id="task-plan-form"><div class="dialog-header"><h2 id="task-plan-title">План задачи</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p class="muted">Шаг «Тесты» завершится только после успешного запуска. Первичная диагностика падающих тестов — шаг «Изучение».</p>
+      <div id="plan-editor"></div><button id="add-plan-step" class="quiet" type="button">＋ Добавить шаг</button><p id="plan-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Сохранить план</button></div>
+    </form>
+  </dialog>
+  <dialog id="task-branch-dialog" aria-labelledby="task-branch-title">
+    <form id="task-branch-form"><div class="dialog-header"><h2 id="task-branch-title">Отдельная ветка задачи</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p class="muted">Начальный снимок включает файлы проекта с диска и незакоммиченные правки. Несохранённые черновики редактора остаются в исходной папке. В истории ветки будет отдельный начальный коммит со снимком.</p>
+      <label for="task-branch-name">Ветка</label><input id="task-branch-name" maxlength="100" required><p id="branch-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="confirm-task-branch" class="primary" type="submit">Создать рабочую папку</button></div>
+    </form>
+  </dialog>
+  <dialog id="task-transfer-dialog" class="changes-dialog" aria-labelledby="task-transfer-title">
+    <div class="dialog-header"><h2 id="task-transfer-title">Перенос в исходный проект</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <p id="transfer-note" class="muted" role="status"></p><div id="transfer-files"></div><div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="apply-task-transfer" class="primary" type="button" disabled>Перенести правки</button></div>
+  </dialog>
 
   <dialog id="project-dialog" aria-labelledby="project-dialog-title">
     <form id="project-form">

@@ -5,6 +5,14 @@ const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(da
 
 contextBridge.exposeInMainWorld('alicecode', {
   state: invoke('app:state'),
+  taskOptions: invoke('task:options'),
+  instructions: invoke('project:instructions'),
+  saveInstructions: invoke('project:save-instructions'),
+  planTask: invoke('task:plan'),
+  taskWorkspace: invoke('task:workspace'),
+  transferPreview: invoke('task:transfer-preview'),
+  transferTask: invoke('task:transfer'),
+  resumeTask: invoke('task:resume'),
   saveWorkspace: invoke('workspace:save'),
   flushWorkspace: values => ipcRenderer.sendSync('workspace:flush', values),
   selectMode: invoke('chat:mode'),

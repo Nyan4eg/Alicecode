@@ -50,8 +50,17 @@ export class Store {
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
-    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'" });
-    this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'" });
+    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'",
+      approval: "TEXT NOT NULL DEFAULT 'ask'", planning: 'INTEGER NOT NULL DEFAULT 0', draftPlan: 'TEXT', workspace: 'TEXT' });
+    this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'", task: 'TEXT' });
+    for (const row of this.db.prepare("SELECT id,task FROM messages WHERE task IS NOT NULL AND status='cancelled'").all()) {
+      const task = JSON.parse(row.task);
+      if (['running', 'planning'].includes(task.status)) {
+        task.status = 'stopped';
+        for (const step of task.steps ?? []) if (step.status === 'running') { step.status = 'stopped'; step.note = 'Прервано перезапуском приложения.'; }
+        this.db.prepare('UPDATE messages SET task=? WHERE id=?').run(JSON.stringify(task), row.id);
+      }
+    }
     this.db.prepare('UPDATE chats SET modelId=? WHERE modelId IS NULL').run(legacyModel.id);
     this.db.function('search_fold', { deterministic: true }, fold);
   }
@@ -69,6 +78,7 @@ export class Store {
 
   saveWorkspace(scope, id, value) {
     if (scope === 'chat') this.chat(id);
+    else if (scope === 'editor') this.chat(id);
     else if (scope !== 'project' || !this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(id)) throw new Error('Проект не найден.');
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Некорректное состояние окна.');
     const data = JSON.stringify(value);
@@ -95,6 +105,28 @@ export class Store {
     this.chat(chatId);
     if (!['code', 'discuss'].includes(mode)) throw new Error('Неизвестный режим.');
     this.db.prepare('UPDATE chats SET mode=? WHERE id=?').run(mode, chatId);
+  }
+
+  setTaskOptions(id, { approval, planning }) {
+    this.chat(id);
+    if (!['ask', 'bypass'].includes(approval) || typeof planning !== 'boolean') throw new Error('Неизвестный режим разрешений.');
+    this.db.prepare('UPDATE chats SET approval=?,planning=? WHERE id=?').run(approval, Number(planning), id);
+  }
+
+  setDraftPlan(id, plan) {
+    this.chat(id);
+    this.db.prepare('UPDATE chats SET draftPlan=? WHERE id=?').run(plan ? JSON.stringify(plan) : null, id);
+  }
+
+  setTaskWorkspace(id, workspace) {
+    this.chat(id);
+    this.db.prepare('UPDATE chats SET workspace=?,sessionId=NULL WHERE id=?').run(JSON.stringify(workspace), id);
+  }
+
+  task(chatId, messageId) {
+    const row = this.db.prepare('SELECT task FROM messages WHERE chatId=? AND id=?').get(chatId, messageId);
+    if (!row?.task) throw new Error('Задача не найдена.');
+    return JSON.parse(row.task);
   }
 
   set(key, value) {
@@ -141,7 +173,9 @@ export class Store {
     const chat = this.db.prepare(`SELECT chats.*, projects.path AS cwd, projects.title AS projectTitle
       FROM chats JOIN projects ON projects.id=chats.projectId WHERE chats.id=?`).get(id);
     if (!chat) throw new Error('Чат не найден.');
-    return chat;
+    const workspace = chat.workspace ? JSON.parse(chat.workspace) : null;
+    return { ...chat, projectCwd: chat.cwd, cwd: workspace?.root ?? chat.cwd, workspace,
+      draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null };
   }
 
   select(id) {
@@ -207,6 +241,7 @@ export class Store {
       this.db.prepare('DELETE FROM messages WHERE chatId=?').run(id);
       this.db.prepare('DELETE FROM draft_files WHERE chatId=?').run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='chat' AND id=?").run(id);
+      this.db.prepare("DELETE FROM workspace_states WHERE scope='editor' AND id=?").run(id);
       this.db.prepare('DELETE FROM chats WHERE id=?').run(id);
       this.leaveChat(chat);
       if (chat.sessionId && !this.db.prepare('SELECT 1 FROM chats WHERE sessionId=?').get(chat.sessionId)) {
@@ -327,20 +362,22 @@ export class Store {
     return file;
   }
 
-  saveTurn(id, { text, tools, status, error }) {
-    this.db.prepare('UPDATE messages SET text=?, tools=?, status=?, error=? WHERE id=?')
-      .run(text, JSON.stringify(tools), status, error ?? null, id);
+  saveTurn(id, { text, tools, status, error, task }) {
+    this.db.prepare('UPDATE messages SET text=?, tools=?, status=?, error=?, task=? WHERE id=?')
+      .run(text, JSON.stringify(tools), status, error ?? null, task ? JSON.stringify(task) : null, id);
   }
 
   snapshot() {
     const activeChat = this.setting('activeChat') ?? null;
     const projects = this.db.prepare('SELECT * FROM projects ORDER BY rowid DESC').all();
-    const chats = this.db.prepare('SELECT * FROM chats ORDER BY updatedAt DESC, rowid DESC').all();
+    const chats = this.db.prepare('SELECT * FROM chats ORDER BY updatedAt DESC, rowid DESC').all()
+      .map(chat => ({ ...chat, workspace: chat.workspace ? JSON.parse(chat.workspace) : null, draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null }));
     const messages = activeChat ? this.db.prepare(`SELECT messages.*, run_reviews.summary,
       (SELECT json_group_array(DISTINCT path) FROM managed_edits WHERE messageId=messages.id AND state='applied') AS managed
       FROM messages
       LEFT JOIN run_reviews ON messageId=messages.id WHERE chatId=? ORDER BY messages.id`).all(activeChat)
       .map(({ summary, managed, ...message }) => ({ ...message, tools: JSON.parse(message.tools),
+        task: message.task ? JSON.parse(message.task) : null,
         attachments: JSON.parse(message.attachments), review: summary ? JSON.parse(summary) : null,
         managedPaths: JSON.parse(managed) })) : [];
     return { activeChat, projects, chats, messages };

@@ -52,6 +52,9 @@ let restoringWorkspace = false;
 let restoreGeneration = 0;
 let contentTimer;
 let contentRequest = 0;
+let instructionsTarget;
+let planTarget;
+let transferTarget;
 const providerLabels = { key: 'AI Studio по API-ключу', subscription: 'Yandex Cloud по подписке' };
 
 function element(tag, className, text) {
@@ -276,6 +279,7 @@ function workSummary(message, paths) {
     const details = disclosure(`${message.id}:${tool.id}`, executedCommand(tool) ?? tool.title);
     const [label, tone] = actionOutcome(tool);
     details.querySelector('summary').append(element('span', `outcome ${tone}`, label));
+    if (tool.automatic) details.querySelector('summary').append(element('span', 'outcome auto-decision', 'Авто · Bypass'));
     if (tool.cwd || tool.repeatable) {
       const footer = element('div', 'tool-command');
       if (tool.cwd) footer.append(element('span', 'tool-directory', tool.cwd));
@@ -339,6 +343,7 @@ function renderMessage(message) {
     state.models.find(model => model.id === message.modelId)?.label ?? message.modelId));
   if (message.mode === 'discuss') role.append(element('span', 'mode-badge', 'Обсуждение · только чтение'));
   row.append(role);
+  if (message.task) row.append(renderTask(message));
   const paths = [...new Set(message.tools.filter(tool => tool.status === 'completed' && tool.decision !== 'denied')
     .flatMap(tool => tool.paths ?? []))];
   const visibleFiles = [...folders.values()].flatMap(folder => (folder.entries ?? []).filter(item => !item.directory).map(item => item.path));
@@ -376,9 +381,23 @@ function renderThread(forceScroll) {
 
 function renderComposer() {
   const chat = activeChat();
+  $('approval-mode').value = chat?.approval ?? 'ask';
+  $('approval-mode').disabled = !chat || Boolean(chat.archivedAt) || state.busy === chat.id;
+  $('use-plan').checked = Boolean(chat?.planning);
+  $('use-plan').disabled = !chat || Boolean(chat.archivedAt) || state.busy === chat.id || chat.mode === 'discuss';
+  $('prepare-plan').disabled = !chat || !state.configured || Boolean(state.busy || state.workspaceMutation || chat.archivedAt) || !$('prompt').value.trim();
+  $('composer').classList.toggle('bypass-active', chat?.approval === 'bypass' && chat.mode === 'code');
+  $('draft-plan-card').hidden = !chat?.draftPlan || !chat.planning || chat.mode === 'discuss';
+  $('draft-plan-steps').replaceChildren(...(chat?.draftPlan?.steps ?? []).map(step => element('li', '', step.title)));
+  $('taskbar').hidden = !chat;
+  $('create-task-branch').hidden = Boolean(chat?.workspace);
+  $('transfer-task').hidden = !chat?.workspace;
+  for (const id of ['create-task-branch', 'transfer-task', 'project-instructions']) $(id).disabled = Boolean(state.busy || state.workspaceMutation || chat?.archivedAt);
+  const location = setText('task-location', chat?.workspace ? chat.workspace.branch + ' · рабочая папка задачи' : 'Исходная папка проекта');
+  location.title = chat?.workspace?.root ?? '';
   $('chat-mode').value = chat?.mode ?? 'code';
   $('chat-mode').disabled = !chat || Boolean(chat.archivedAt) || state.busy === chat.id;
-  setText('mode-note', chat?.mode === 'discuss' ? 'Только чтение и поиск · без команд' : 'Правки и команды — с разрешения');
+  setText('mode-note', chat?.mode === 'discuss' ? 'Только чтение и поиск · без команд' : chat?.approval === 'bypass' ? 'Все действия одобряются автоматически' : 'Правки и команды — с разрешения');
   $('composer-area').hidden = !chat;
   $('archive-banner').hidden = !chat?.archivedAt;
   $('composer').hidden = Boolean(chat?.archivedAt);
@@ -504,7 +523,9 @@ function renderUpdates() {
 
 function updateState(next) {
   const previous = state;
-  const changed = previous?.activeChat !== next.activeChat;
+  const previousChat = previous?.chats.find(item => item.id === previous.activeChat);
+  const nextChat = next.chats.find(item => item.id === next.activeChat);
+  const changed = previous?.activeChat !== next.activeChat || previousChat?.workspace?.root !== nextChat?.workspace?.root;
   if (changed && previous?.activeChat && next.chats.some(item => item.id === previous.activeChat)) persistWorkspace();
   if (!previous) {
     for (const [id, saved] of Object.entries(next.chatStates ?? {})) {
@@ -516,6 +537,7 @@ function updateState(next) {
     for (const [id, saved] of Object.entries(next.projectStates ?? {})) {
       editorFiles.set(id, new Map((saved.files ?? []).map(file => [file.path, file])));
     }
+    for (const [id, saved] of Object.entries(next.editorStates ?? {})) editorFiles.set('task:' + id, new Map((saved.files ?? []).map(file => [file.path, file])));
   }
   if (changed && previous?.activeChat) drafts.set(previous.activeChat, $('prompt').value);
   state = next;
@@ -529,7 +551,7 @@ function updateState(next) {
     workspace = undefined;
     folders.clear();
     const priorProject = previous?.chats.find(item => item.id === previous.activeChat)?.projectId;
-    if (priorProject !== activeChat()?.projectId) {
+    if (priorProject !== activeChat()?.projectId || previousChat?.workspace?.root !== nextChat?.workspace?.root) {
       expandedFolders.clear();
       folderLimits.clear();
     }
@@ -1534,7 +1556,7 @@ async function toggleArchive(chat) {
 }
 
 function editorGroup() {
-  const projectId = activeChat()?.projectId;
+  const projectId = activeChat()?.workspace ? 'task:' + activeChat().id : activeChat()?.projectId;
   if (!editorFiles.has(projectId) && projectId) editorFiles.set(projectId, new Map());
   return editorFiles.get(projectId);
 }
@@ -2022,7 +2044,7 @@ function workspaceValues() {
   } };
   drafts.set(chat.id, value.draft);
   chatViews.set(chat.id, value.view);
-  return [['chat', chat.id, value], ['project', chat.projectId, { files: [...(editorGroup()?.values() ?? [])] }]];
+  return [['chat', chat.id, value], [chat.workspace ? 'editor' : 'project', chat.workspace ? chat.id : chat.projectId, { files: [...(editorGroup()?.values() ?? [])] }]];
 }
 
 function persistWorkspace() {
@@ -2104,6 +2126,145 @@ $('find-content').addEventListener('click', openContentSearch);
 $('content-query').addEventListener('input', () => { clearTimeout(contentTimer); contentRequest++; contentTimer = setTimeout(runContentSearch, 280); });
 $('content-query').addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); clearTimeout(contentTimer); void runContentSearch(); }
+});
+
+function renderTask(message) {
+  const task = message.task;
+  const panel = element('section', 'task-card');
+  const head = element('div', 'task-heading');
+  head.append(element('strong', '', task.steps.length ? 'План выполнения' : 'Задача'));
+  if (task.approval === 'bypass' && message.mode === 'code') head.append(element('span', 'bypass-badge', 'Bypass'));
+  if (task.workspace) head.append(element('span', 'task-branch-label', task.workspace.branch));
+  panel.append(head);
+  if (task.steps.length) {
+    const steps = element('ol', 'task-steps');
+    const labels = { pending: 'Ожидает', running: 'Выполняется', done: 'Готово', error: 'Ошибка', stopped: 'Остановлено' };
+    for (const step of task.steps) {
+      const row = element('li', 'task-step step-' + step.status);
+      row.append(element('span', 'step-state', labels[step.status] ?? step.status), document.createTextNode(step.title));
+      if (step.note) row.append(element('small', '', step.note));
+      if (step.evidence?.length) {
+        const evidence = element('details', 'step-evidence'); evidence.append(element('summary', '', 'Действия · ' + step.evidence.length));
+        for (const tool of step.evidence) evidence.append(element('div', '', tool.title + (Number.isInteger(tool.exitCode) ? ' · код ' + tool.exitCode : '')));
+        row.append(evidence);
+      }
+      steps.append(row);
+    }
+    panel.append(steps);
+    if (message.status !== 'running' && task.steps.some(step => step.status !== 'done')) {
+      const resume = element('button', 'quiet', 'Продолжить план'); resume.type = 'button';
+      resume.disabled = Boolean(state.busy || state.workspaceMutation || activeChat()?.archivedAt);
+      resume.addEventListener('click', () => api.resumeTask(message.chatId, message.id).catch(toast)); panel.append(resume);
+    }
+  } else if (task.status === 'planning') panel.append(element('p', 'busy-text', 'Алиса составляет план…'));
+  if (task.instructions.text) {
+    const button = element('button', 'quiet task-instructions', 'AGENTS.md · снимок инструкций'); button.type = 'button';
+    button.addEventListener('click', () => openInstructions(task.instructions)); panel.append(button);
+  }
+  return panel;
+}
+
+async function openInstructions(snapshot = null) {
+  if (document.querySelector('dialog[open]')) return;
+  const chatId = state.activeChat;
+  try {
+    const file = snapshot ?? await api.instructions(chatId);
+    instructionsTarget = { chatId, file, snapshot: Boolean(snapshot) };
+    $('instructions-text').value = file.text;
+    $('instructions-text').readOnly = Boolean(snapshot);
+    $('instructions-text').placeholder = '# Инструкции проекта\n\n## Тесты\nnode --test\n\n## Требования\nСохраняй существующие пользовательские изменения.\n';
+    setText('instructions-note', snapshot ? 'Снимок AGENTS.md, использованный в этом запуске: ' + file.stamp
+      : 'AGENTS.md в текущей рабочей папке. Изменения применяются со следующего запуска задачи.');
+    $('save-instructions').hidden = Boolean(snapshot);
+    $('instructions-error').hidden = true;
+    $('instructions-dialog').showModal();
+  } catch (error) { toast(error); }
+}
+$('project-instructions').addEventListener('click', () => openInstructions());
+$('instructions-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const target = instructionsTarget;
+  if (!target || target.snapshot) return;
+  try {
+    await api.saveInstructions(target.chatId, $('instructions-text').value, target.file.stamp);
+    $('instructions-dialog').close(); refreshWorkspace();
+  } catch (error) { setText('instructions-error', errorText(error)).hidden = false; }
+});
+
+async function changeTaskOptions() {
+  try { updateState(await api.taskOptions(state.activeChat, { approval: $('approval-mode').value, planning: $('use-plan').checked })); }
+  catch (error) { toast(error); renderComposer(); }
+}
+$('approval-mode').addEventListener('change', changeTaskOptions);
+$('use-plan').addEventListener('change', changeTaskOptions);
+
+function planEditorRow(step = { title: '', kind: 'other' }) {
+  const row = element('div', 'plan-editor-row');
+  const title = element('input'); title.value = step.title; title.maxLength = 240; title.required = true; title.setAttribute('aria-label', 'Шаг плана');
+  const kind = element('select'); kind.setAttribute('aria-label', 'Тип шага');
+  for (const [id, label] of [['inspect', 'Изучение'], ['edit', 'Изменение'], ['test', 'Тесты'], ['other', 'Другое']]) {
+    const option = element('option', '', label); option.value = id; kind.append(option);
+  }
+  kind.value = step.kind;
+  const remove = element('button', 'quiet', '×'); remove.type = 'button'; remove.setAttribute('aria-label', 'Убрать шаг'); remove.addEventListener('click', () => row.remove());
+  row.append(title, kind, remove); return row;
+}
+function editDraftPlan(manual = false) {
+  const chat = activeChat();
+  if (!chat || (!chat.draftPlan && !manual) || document.querySelector('dialog[open]')) return;
+  planTarget = { chatId: chat.id, source: chat.draftPlan?.source ?? $('prompt').value.trim() };
+  $('plan-editor').replaceChildren(...(chat.draftPlan?.steps ?? [{ title: '', kind: 'inspect' }]).map(planEditorRow));
+  $('plan-error').hidden = true; $('task-plan-dialog').showModal();
+}
+$('edit-draft-plan').addEventListener('click', editDraftPlan);
+$('add-plan-step').addEventListener('click', () => { if ($('plan-editor').children.length < 8) $('plan-editor').append(planEditorRow()); });
+$('task-plan-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  try {
+    const steps = [...$('plan-editor').children].map(row => ({ title: row.querySelector('input').value, kind: row.querySelector('select').value }));
+    updateState(await api.planTask(planTarget.chatId, planTarget.source, steps)); $('task-plan-dialog').close();
+  } catch (error) { setText('plan-error', errorText(error)).hidden = false; }
+});
+$('prepare-plan').addEventListener('click', async () => {
+  if (activeChat()?.draftPlan?.source === $('prompt').value.trim()) return editDraftPlan();
+  try { updateState(await api.planTask(state.activeChat, $('prompt').value)); $('draft-plan-card').open = true; }
+  catch (error) { editDraftPlan(true); setText('plan-error', errorText(error) + ' Можно задать шаги вручную.').hidden = false; }
+});
+$('create-task-branch').addEventListener('click', () => {
+  $('task-branch-name').value = 'alice/task-' + state.activeChat.slice(0, 8);
+  $('branch-error').hidden = true; $('task-branch-dialog').showModal();
+});
+$('task-branch-form').addEventListener('submit', async event => {
+  event.preventDefault(); $('confirm-task-branch').disabled = true;
+  try { updateState(await api.taskWorkspace(state.activeChat, $('task-branch-name').value.trim())); $('task-branch-dialog').close(); }
+  catch (error) { setText('branch-error', errorText(error)).hidden = false; }
+  finally { $('confirm-task-branch').disabled = false; }
+});
+async function showTransfer() {
+  transferTarget = { chatId: state.activeChat, token: null };
+  const target = transferTarget;
+  $('apply-task-transfer').disabled = true; $('transfer-files').replaceChildren();
+  setText('transfer-note', 'Сравниваем результат с исходным проектом…'); $('task-transfer-dialog').showModal();
+  try {
+    const result = await api.transferPreview(target.chatId);
+    if (target !== transferTarget) return;
+    target.token = result.token;
+    setText('transfer-note', result.conflict ? 'Есть конфликт. Исходные файлы не будут перезаписаны.'
+      : result.files.length ? 'Переносится разница от начального снимка задачи. Индекс Git исходного проекта сохраняется.' : 'Изменений задачи нет.');
+    for (const file of result.files) {
+      const group = element('details', 'transfer-file'); group.open = Boolean(file.conflict);
+      group.append(element('summary', file.conflict ? 'error' : '', file.path + (file.conflict ? ' · конфликт' : '')),
+        element('pre', 'context-text', file.conflict ?? (file.patch || (file.changed ? 'Создание или удаление пустого файла.' : 'Изменение уже перенесено.'))));
+      $('transfer-files').append(group);
+    }
+    $('apply-task-transfer').disabled = result.conflict || !result.files.some(file => file.changed);
+  } catch (error) { setText('transfer-note', errorText(error)); }
+}
+$('transfer-task').addEventListener('click', showTransfer);
+$('apply-task-transfer').addEventListener('click', async () => {
+  const target = transferTarget; $('apply-task-transfer').disabled = true;
+  try { const files = await api.transferTask(target.chatId, target.token); setText('transfer-note', 'Перенесено файлов: ' + files.length + '. Исходный индекс Git сохранён.'); }
+  catch (error) { setText('transfer-note', errorText(error) + ' Закройте и откройте перенос заново.'); }
 });
 
 api.state().then(updateState).catch(toast);

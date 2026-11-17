@@ -9,6 +9,10 @@ import { alias } from './adapter.mjs';
 import { readPrototypeCredentials, validateCredentials } from './credentials.mjs';
 import { createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles, searchContent } from './workspace.mjs';
 import { discuss } from './discussion.mjs';
+import { consent } from './permissions.mjs';
+import { projectInstructions, saveInstructions, instructionsPrompt } from './instructions.mjs';
+import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
+import { createTaskWorkspace, transferPreview, applyTransfer } from './task-workspace.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
@@ -48,6 +52,7 @@ function snapshot() {
   return {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
     chatStates: store.workspaceStates('chat'), projectStates: store.workspaceStates('project'),
+    editorStates: store.workspaceStates('editor'),
     draftFiles: Object.fromEntries([...attachments.drafts].map(([id, files]) => [id, [...files.values()].map(({ text, ...file }) => file)])),
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
     workspaceMutation,
@@ -183,21 +188,27 @@ function publishTurn(turn) {
 }
 
 function enqueuePermission(turn, details, choose) {
-  if (turn.stop || active !== turn) return cancelledPermission();
-  return new Promise(resolvePermission => {
-    turn.permissions.push({ details, choose, resolvePermission });
-    emit('app:state', snapshot());
-  });
+  return consent(turn, details, choose, { isActive: () => active === turn,
+    record: (details, allowed, automatic) => recordDecision(turn, details, allowed, automatic),
+    changed: () => emit('app:state', snapshot()) });
+}
+
+function recordDecision(turn, details, allow, automatic = false) {
+  const tool = turn.tools.get(details.id) ?? { id: details.id, title: details.title, kind: details.kind === 'managed-write' ? 'edit' : details.kind,
+    ...(details.path ? { paths: [details.path] } : {}), ...(details.command ? { command: details.command } : {}) };
+  turn.tools.set(details.id, { ...tool, decision: allow ? 'allowed' : 'denied', automatic,
+    ...(details.kind === 'managed-write' ? { status: allow ? 'in_progress' : 'failed' } : {}) });
+  publishTurn(turn);
 }
 
 async function requestPermission(turn, params) {
   if (turn.mode === 'discuss') return cancelledPermission();
-  const permit = params.options.find(option => option.kind === 'allow_once');
+  const permit = params.options.find(option => option.kind === 'allow_once') ?? params.options.find(option => option.kind.startsWith('allow'));
   if (!permit) return cancelledPermission();
   const reject = params.options.find(option => option.kind === 'reject_once');
   const tool = params.toolCall;
   const details = { id: tool.toolCallId, chatId: turn.chatId, ...describePermission(tool, turn.cwd, turn.shellCwd) };
-  if (details.kind === 'edit' && details.changes.some(change => attachments.isSnapshot(change.path, turn.cwd))) {
+  if (turn.approval !== 'bypass' && details.kind === 'edit' && details.changes.some(change => attachments.isSnapshot(change.path, turn.cwd))) {
     return reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelledPermission();
   }
   let proposed;
@@ -219,11 +230,7 @@ function resolvePermission(id, allow) {
   const p = active?.permissions[0];
   if (!p || p.details.id !== id) return;
   active.permissions.shift();
-  if (p.details.kind !== 'managed-write') {
-    const tool = active.tools.get(id) ?? { id, title: p.details.title };
-    active.tools.set(id, { ...tool, decision: allow ? 'allowed' : 'denied' });
-    publishTurn(active);
-  }
+  recordDecision(active, p.details, allow);
   p.resolvePermission(p.choose(allow));
   emit('app:state', snapshot());
 }
@@ -263,9 +270,11 @@ async function fileRequest(turn, method, params) {
   }
   const content = agentTextForDisk(file.text, params.content);
   if (content === file.text) return {};
+  let writeApprovalId;
   if (!approved || approved.after !== params.content) {
     const patch = await editDiff(file.text, content);
-    const allow = await enqueuePermission(turn, { id: randomUUID(), chatId: turn.chatId, kind: 'managed-write',
+    writeApprovalId = randomUUID();
+    const allow = await enqueuePermission(turn, { id: writeApprovalId, chatId: turn.chatId, kind: 'managed-write',
       title: 'Применить правку к файлу?', path: file.path, patch }, value => value);
     if (allow !== true) throw new Error('Пользователь отклонил запись файла.');
   }
@@ -279,6 +288,10 @@ async function fileRequest(turn, method, params) {
     applied = true;
   } finally {
     if (receipt !== null) store.finishManagedEdit(receipt, applied);
+    if (writeApprovalId && turn.tools.has(writeApprovalId)) {
+      turn.tools.set(writeApprovalId, { ...turn.tools.get(writeApprovalId), status: applied ? 'completed' : 'failed' });
+      publishTurn(turn);
+    }
   }
   return {};
 }
@@ -296,6 +309,11 @@ async function mutateWorkspace(operation) {
     workspaceMutation = false;
     emit('app:state', snapshot());
   }
+}
+
+async function mutateState(operation) {
+  await mutateWorkspace(operation);
+  return snapshot();
 }
 
 async function prepareReview(turn) {
@@ -319,6 +337,10 @@ async function completeTurn(turn, baseline) {
   try {
     turn.message.review = store.saveReview(turn.message.id, review);
     turn.message.status = turn.stop ? 'cancelled' : turn.message.error ? 'error' : 'done';
+    if (turn.message.task) {
+      turn.message.task.status = turn.stop ? 'stopped' : turn.message.error ? 'error' : 'done';
+      for (const step of turn.message.task.steps) if (step.status === 'running') { step.status = turn.stop ? 'stopped' : 'error'; step.note = turn.message.error; }
+    }
     publishTurn(turn);
   } finally {
     active = undefined;
@@ -326,7 +348,7 @@ async function completeTurn(turn, baseline) {
   }
 }
 
-async function send(chatId, input, refs = [], externalIds = []) {
+async function send(chatId, input, refs = [], externalIds = [], resume = null) {
   assertIdle();
   if (!credentials) throw new Error('Настройте подключение к Yandex.');
   const text = typeof input === 'string' ? input.trim() : '';
@@ -340,15 +362,19 @@ async function send(chatId, input, refs = [], externalIds = []) {
   if (!model) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
+  const instructionSnapshot = resume?.instructions ?? await projectInstructions(chat.cwd);
+  assertIdle();
+  const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot,
+    source: resume?.source ?? text, steps: resume?.steps?.map(step => ({ ...step, status: step.status === 'done' ? 'done' : 'pending' })) ?? [], status: 'running' };
   const message = {
     id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
       ...external.map(({ text, ...item }) => item)], chat.mode),
-    chatId, modelId: model.id, mode: chat.mode,
+    chatId, modelId: model.id, mode: chat.mode, task,
     role: 'assistant', text: '', tools: [], status: 'running',
   };
   const savedWorkspace = store.workspaceStates('chat')[chatId];
   if (savedWorkspace) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
-  const turn = { chatId, mode: chat.mode, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
+  const turn = { chatId, mode: chat.mode, approval: chat.approval, abort: new AbortController(), cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
     approvedEdits: new Map(), fileReads: new Map(), attachments: store.externalAttachments(chatId) };
   active = turn;
   emit('app:state', snapshot());
@@ -363,13 +389,13 @@ async function send(chatId, input, refs = [], externalIds = []) {
     const referenceCatalog = turn.attachments.length ? 'Справочные вложения этого чата (только чтение, доступны встроенным инструментом чтения):\n'
       + [...new Map(turn.attachments.map(file => [file.id, file])).values()].slice(-32)
         .map(file => JSON.stringify(file.label) + ': ' + JSON.stringify(attachments.path(chatId, file).replaceAll('\\', '/'))).join('\n') : '';
+    const instructionText = instructionsPrompt(instructionSnapshot);
     if (chat.mode === 'discuss') {
-      turn.abort = new AbortController();
       const history = store.db.prepare("SELECT role,text FROM messages WHERE chatId=? AND id<? AND text<>'' ORDER BY id DESC LIMIT 24")
         .all(chatId, message.id - 1).reverse().map(item => ({ role: item.role, content: item.text.slice(-12000) }));
       const provider = createProvider(credentials);
       await discuss({ root: chat.cwd, provider, model: provider.model(credentials.folderId, model.id), folderId: credentials.folderId,
-        history, prompt: [text, referenceCatalog, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)].join('\n\n'),
+        history, prompt: [instructionText, text, referenceCatalog, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)].join('\n\n'),
         signal: turn.abort.signal,
         readAttachment: path => attachments.read(chatId, turn.attachments, path),
         onText: text => { message.text += (message.text ? '\n\n' : '') + text; publishTurn(turn); },
@@ -377,6 +403,15 @@ async function send(chatId, input, refs = [], externalIds = []) {
       });
       return;
     }
+    if (chat.planning && !resume) {
+      turn.stage = 'plan'; task.status = 'planning'; publishTurn(turn); emit('app:state', snapshot());
+      const draft = chat.draftPlan?.source === text ? chat.draftPlan
+        : await generatePlan(createProvider(credentials), createProvider(credentials).model(credentials.folderId, model.id), credentials.folderId, text, instructionSnapshot, turn.abort.signal);
+      task.steps = validatePlan(draft.steps); task.status = 'running';
+      store.setDraftPlan(chatId, null); publishTurn(turn);
+    }
+    if (turn.stop) return;
+    turn.stage = 'agent'; emit('app:state', snapshot());
     if (runtime && runtime.modelId !== model.id) closeRuntime();
     runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model);
     if (turn.stop) return;
@@ -403,14 +438,29 @@ async function send(chatId, input, refs = [], externalIds = []) {
     }
     if (turn.stop) return;
     const discussion = store.db.prepare("SELECT text FROM messages WHERE chatId=? AND mode='discuss' AND role='assistant' AND status='done' ORDER BY id DESC LIMIT 1").get(chatId)?.text;
-    const result = await turn.client.request('session/prompt', {
-      sessionId: turn.sessionId, prompt: [text, referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)]
-        .map(text => ({ type: 'text', text })),
-    }, 240_000);
-    if (result.stopReason === 'cancelled') turn.stop = true;
-    if (!turn.stop && !message.text && !turn.tools.size) throw new Error('Алиса вернула пустой ответ.');
-    if (result.stopReason && !['end_turn', 'cancelled'].includes(result.stopReason)) {
-      throw new Error(`Grok Build завершил задачу со статусом ${result.stopReason}.`);
+    const common = [instructionText, referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)];
+    const run = async text => {
+      const length = message.text.length, count = turn.tools.size;
+      const result = await turn.client.request('session/prompt', { sessionId: turn.sessionId,
+        prompt: [text, ...common].filter(Boolean).map(text => ({ type: 'text', text })) }, 240000);
+      if (result.stopReason === 'cancelled') turn.stop = true;
+      if (!turn.stop && message.text.length === length && turn.tools.size === count) throw new Error('Алиса вернула пустой ответ.');
+      if (result.stopReason && !['end_turn', 'cancelled'].includes(result.stopReason)) throw new Error(`Grok Build завершил задачу со статусом ${result.stopReason}.`);
+    };
+    if (!task.steps.length) await run(text);
+    else for (const [index, step] of task.steps.entries()) {
+      if (turn.stop) break;
+      if (step.status === 'done') continue;
+      step.status = 'running'; delete step.note; delete step.evidence; publishTurn(turn);
+      const before = new Set(turn.tools.keys());
+      message.text += `\n\n### Шаг ${index + 1}. ${step.title}\n\n`;
+      await run('Задача: ' + task.source + '\nПлан: ' + task.steps.map((s, i) => `${i + 1}. ${s.title} (${s.status})`).join('\n')
+        + `\nВыполни сейчас только шаг ${index + 1}: ${step.title}. Дождись завершения команд. Сообщи фактический результат. `
+        + (step.kind === 'test' ? 'Обязательно запусти тесты и дождись их кода выхода; не выдавай предположение за выполненную проверку.' : 'Не переходи к следующему шагу самостоятельно.'));
+      if (turn.stop) { step.status = 'stopped'; publishTurn(turn); break; }
+      const actions = [...turn.tools.values()].filter(tool => !before.has(tool.id));
+      if (!finishStep(step, actions, turn.stop ? 'Остановлено пользователем.' : null)) throw new Error(step.note);
+      publishTurn(turn);
     }
   } catch (error) {
     if (!turn.stop) message.error = String(error.message).slice(0, 1000);
@@ -497,7 +547,8 @@ async function saveEditor(chatId, path, expected, draft) {
 }
 
 async function rollbackDetails(chatId, messageId, path) {
-  const root = selectedPath(chatId);
+  const row = store.db.prepare('SELECT task FROM messages WHERE id=? AND chatId=?').get(messageId, chatId);
+  const root = row?.task ? JSON.parse(row.task).root : store.chat(chatId).projectCwd;
   const edits = store.managedEdits(chatId, messageId, path);
   const result = await planRollback(root, path, edits);
   return { root, edits, result };
@@ -567,6 +618,51 @@ if (!app.requestSingleInstanceLock()) {
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
+    const taskChat = id => {
+      const chat = store.chat(id);
+      if (chat.archivedAt) throw new Error('Восстановите чат из архива.');
+      return chat;
+    };
+    bind('task:options', (id, value) => {
+      if (active?.chatId === id) throw new Error('Завершите задачу перед сменой режима.');
+      taskChat(id); store.setTaskOptions(id, value); return snapshot();
+    });
+    bind('project:instructions', id => projectInstructions(selectedPath(id)));
+    bind('project:save-instructions', (id, text, stamp) => mutateWorkspace(() => saveInstructions(selectedPath(id), text, stamp)));
+    bind('task:plan', (id, input, steps = null) => mutateState(async () => {
+      const chat = taskChat(id);
+      const text = typeof input === 'string' ? input.trim() : '';
+      if (!text || text.length > 40000) throw new Error('Введите задачу до 40 000 символов.');
+      let plan;
+      if (steps) plan = { source: text, steps: validatePlan(steps) };
+      else {
+        if (!credentials) throw new Error('Настройте подключение к Yandex.');
+        const model = available.find(m => m.id === chat.modelId);
+        if (!model) throw new Error('Выберите доступную модель.');
+        const provider = createProvider(credentials);
+        plan = await generatePlan(provider, provider.model(credentials.folderId, model.id), credentials.folderId, text, await projectInstructions(chat.cwd), new AbortController().signal);
+      }
+      store.setDraftPlan(id, plan);
+      store.setTaskOptions(id, { approval: chat.approval, planning: true });
+    }));
+    bind('task:workspace', (id, branch) => mutateState(async () => {
+      const chat = taskChat(id);
+      if (chat.workspace) throw new Error('У этого чата уже есть отдельная ветка.');
+      if (chat.sessionId || store.db.prepare("SELECT 1 FROM messages WHERE chatId=? AND mode='code' AND tools<>'[]'").get(id)) throw new Error('Создайте новый чат для отдельной ветки: предыдущие действия привязаны к исходной папке.');
+      const workspace = await createTaskWorkspace(chat.cwd, join(app.getPath('userData'), 'task-workspaces'), id, branch);
+      store.setTaskWorkspace(id, workspace);
+    }));
+    bind('task:transfer-preview', async id => {
+      const result = await transferPreview(taskChat(id).workspace);
+      return { token: result.token, conflict: result.conflict, files: result.files.map(({ path, patch, conflict, current, text }) => ({ path, patch, conflict, changed: !conflict && current.text !== text })) };
+    });
+    bind('task:transfer', (id, token) => mutateWorkspace(() => applyTransfer(taskChat(id).workspace, token)));
+    bind('task:resume', (id, messageId) => {
+      const task = store.task(id, messageId);
+      if (taskChat(id).mode !== 'code') throw new Error('Переключите чат в режим «Изменить код», чтобы продолжить план.');
+      if (task.root !== taskChat(id).cwd || !task.steps.some(step => step.status !== 'done')) throw new Error('Нет незавершённых шагов в этой рабочей папке.');
+      return send(id, 'Продолжи незавершённые шаги сохранённого плана.', [], [], task);
+    });
     bind('app:copy', value => { if (typeof value === 'string' && value.length <= 200000) clipboard.writeText(value); });
     bind('app:open-external', url => {
       if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new Error('Недопустимый адрес.');
@@ -719,6 +815,10 @@ app.on('before-quit', () => {
     cancelPermissions(active);
     active.client?.close();
     active.message.status = 'cancelled';
+    if (active.message.task) {
+      active.message.task.status = 'stopped';
+      for (const step of active.message.task.steps) if (step.status === 'running') step.status = 'stopped';
+    }
     publishTurn(active);
   }
   closeRuntime();

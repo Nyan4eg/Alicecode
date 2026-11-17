@@ -153,6 +153,24 @@ export function editDiff(before, after) {
   });
 }
 
+export async function mergeText(current, base, desired) {
+  if (current === base) return { text: desired };
+  if (current === desired || base === desired) return { text: current };
+  return temporaryTexts({ 'current.txt': current, 'base.txt': base, 'desired.txt': desired }, async (dir, paths) => {
+    return gitIn(dir, ['merge-file', '-p', '--diff3', '-L', 'Текущий файл', '-L', 'Начало задачи', '-L', 'Результат Алисы', '--', ...paths],
+      { maxBuffer: 4000000 }).then(text => ({ text }), error => {
+      if (Number.isInteger(error.code) && error.code >= 1 && error.code <= 127) return { conflict: error.stdout };
+      throw error;
+    });
+  });
+}
+
+export async function removeChecked(root, previous) {
+  const current = await editableFile(root, previous.path);
+  if (current.stamp !== previous.stamp || current.absolute !== previous.absolute) throw new Error('Файл изменился. Откройте перенос заново.');
+  await unlink(current.absolute);
+}
+
 export async function inverseText(current, before, after) {
   if (current === after) return { text: before };
   if (current === before) return { text: current };

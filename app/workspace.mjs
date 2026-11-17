@@ -52,10 +52,10 @@ export async function readProjectFile(root, target) {
 }
 
 export function gitIn(root, args, options = {}) {
-  const { input, ...settings } = options;
+  const { input, env = {}, ...settings } = options;
   const task = exec('git', ['--literal-pathspecs', ...args], {
     cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 2_000_000, ...settings,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...env },
   });
   if (input != null) {
     task.child.stdin.on('error', () => {});
