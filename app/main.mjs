@@ -13,10 +13,12 @@ import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
 import { finishReview, startReview } from './review.mjs';
 import { replayDetails, runTest, testInvocation } from './replay.mjs';
-import { defaultModel, fetchModels, legacyModel, lookupModel, models } from './models.mjs';
+import { defaultModel, fetchModels, legacyModel, models, modelsFor } from './models.mjs';
 import { normalizeLayout } from './layout.mjs';
 import { agentEdit, agentTextForDisk, editDiff, editableFile, editorText, planRollback, textForDisk, validateText, writeChecked } from './editing.mjs';
 import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from './git.mjs';
+import { Attachments } from './attachments.mjs';
+import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const cancelledPermission = () => ({ outcome: { outcome: 'cancelled' } });
@@ -26,8 +28,11 @@ const devProfile = !app.isPackaged && app.commandLine.getSwitchValue('user-data-
 app.setPath('userData', devProfile || join(app.getPath('appData'), 'Alicecode'));
 let window;
 let store;
+let attachments;
 let credentials;
 let credentialError;
+let providerMode = keyMode;
+const connections = new Map();
 let runtime;
 let active;
 let workspaceMutation = false;
@@ -36,12 +41,15 @@ let catalogStatus = 'loading';
 const updates = createUpdates(state => emit('app:update', state));
 
 function snapshot() {
+  const providerSettings = Object.fromEntries([...connections].map(([mode, value]) => [mode, {
+    folderId: value.folderId, tokenSource: value.tokenSource, cliProfile: value.cliProfile,
+  }]));
   return {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
     workspaceMutation,
     updates: updates.snapshot(),
-    models: available, defaultModel: defaultModel.id, catalogStatus,
+    models: available, defaultModel: defaultModel.id, catalogStatus, providerMode, providerSettings,
     layout: normalizeLayout(JSON.parse(store.setting('layout') ?? '{}')),
     projectRoot: store.setting('projectRoot') ?? join(app.getPath('documents'), 'Alicecode Projects'),
   };
@@ -57,13 +65,25 @@ function closeRuntime() {
 }
 
 async function saveCredentials(value) {
-  const next = validateCredentials(value);
+  const mode = value.mode === subscriptionMode ? subscriptionMode : keyMode;
+  const existing = connections.get(mode);
+  const next = mode === subscriptionMode
+    ? validateSubscription({ ...value, iamToken: value.iamToken || existing?.iamToken || '' })
+    : validateCredentials({ ...value, apiKey: value.apiKey || existing?.apiKey || '' });
   const bytes = await safeStorage.encryptStringAsync(JSON.stringify(next));
-  store.set('credentials', bytes.toString('base64'));
+  assertIdle();
+  store.set(mode === subscriptionMode ? 'subscriptionCredentials' : 'credentials', bytes.toString('base64'));
+  store.set('providerMode', mode);
+  connections.set(mode, next);
+  activateCredentials(mode);
+}
+
+function activateCredentials(mode) {
   closeRuntime();
-  credentials = next;
-  credentialError = null;
-  available = models;
+  providerMode = mode;
+  credentials = connections.get(mode);
+  credentialError = credentials ? null : credentialError;
+  available = modelsFor(mode);
   catalogStatus = 'loading';
 }
 
@@ -76,7 +96,7 @@ async function refreshModels() {
     const result = await fetchModels(source);
     if (credentials !== source) return;
     available = result;
-    catalogStatus = 'ready';
+    catalogStatus = source.mode === subscriptionMode ? 'documented' : 'ready';
   } catch {
     if (credentials !== source) return;
     catalogStatus = 'error';
@@ -85,14 +105,48 @@ async function refreshModels() {
 }
 
 async function importCredentials() {
-  const saved = store.setting('credentials');
-  if (saved) {
-    const { result } = await safeStorage.decryptStringAsync(Buffer.from(saved, 'base64'));
-    credentials = validateCredentials(JSON.parse(result));
-  } else if (!devProfile) {
-    const value = await readPrototypeCredentials();
-    if (value) await saveCredentials(value);
+  const mode = store.setting('providerMode') === subscriptionMode ? subscriptionMode : keyMode;
+  for (const [kind, setting, validate] of [[keyMode, 'credentials', validateCredentials],
+    [subscriptionMode, 'subscriptionCredentials', validateSubscription]]) {
+    try {
+      const saved = store.setting(setting);
+      if (saved) {
+        const { result } = await safeStorage.decryptStringAsync(Buffer.from(saved, 'base64'));
+        connections.set(kind, validate(JSON.parse(result)));
+      } else if (kind === keyMode && !devProfile) {
+        const value = await readPrototypeCredentials();
+        if (value) {
+          const bytes = await safeStorage.encryptStringAsync(JSON.stringify(value));
+          store.set(setting, bytes.toString('base64'));
+          connections.set(kind, value);
+        }
+      }
+    } catch (error) {
+      if (kind === mode) credentialError = error.message;
+    }
   }
+  activateCredentials(mode);
+}
+
+async function checkConnection() {
+  if (!credentials) throw new Error('Сначала сохраните настройки подключения.');
+  const source = credentials;
+  const provider = createProvider(source);
+  const { response, redact } = await provider.request('/chat/completions', {
+    method: 'POST',
+    headers: { 'OpenAI-Project': source.folderId, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: provider.model(source.folderId, available[0]?.id ?? defaultModel.id),
+      messages: [{ role: 'user', content: 'Ответь OK.' }], max_tokens: 1 }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    const message = providerError(source.mode, response.status) ?? redact(await response.text()).slice(0, 500);
+    if (!response.bodyUsed) await response.body?.cancel();
+    throw new Error(message || 'Yandex вернул HTTP ' + response.status);
+  }
+  await response.body?.cancel();
+  if (source !== credentials) throw new Error('Подключение сменилось. Запустите проверку ещё раз.');
+  return true;
 }
 
 function updateTurn(turn, { sessionId, update }) {
@@ -139,6 +193,9 @@ async function requestPermission(turn, params) {
   const reject = params.options.find(option => option.kind === 'reject_once');
   const tool = params.toolCall;
   const details = { id: tool.toolCallId, chatId: turn.chatId, ...describePermission(tool, turn.cwd, turn.shellCwd) };
+  if (details.kind === 'edit' && details.changes.some(change => attachments.isSnapshot(change.path, turn.cwd))) {
+    return reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelledPermission();
+  }
   let proposed;
   if (details.kind === 'edit' && details.changes.length === 1) {
     try {
@@ -179,13 +236,18 @@ async function fileRequest(turn, method, params) {
   };
   check();
   if (method === 'fs/read_text_file') {
-    const file = await editableFile(turn.cwd, params.path);
-    turn.fileReads.set(file.path, file.stamp);
-    if (!params.line && !params.limit) return { content: file.text };
+    let text = await attachments.read(turn.chatId, turn.attachments, params.path);
+    if (text === null) {
+      const file = await editableFile(turn.cwd, params.path);
+      turn.fileReads.set(file.path, file.stamp);
+      text = file.text;
+    }
+    if (!params.line && !params.limit) return { content: text };
     const first = Math.max(0, (params.line ?? 1) - 1);
-    return { content: file.text.split(/\r?\n/).slice(first, first + (params.limit ?? Infinity)).join('\n') };
+    return { content: text.split(/\r?\n/).slice(first, first + (params.limit ?? Infinity)).join('\n') };
   }
   if (!turn.sessionId) throw new Error('Сессия ещё не открыта.');
+  if (attachments.isSnapshot(params.path, turn.cwd)) throw new Error('Вложения доступны только для чтения.');
   validateText(params.content);
   const file = await editableFile(turn.cwd, params.path, true);
   const approved = turn.approvedEdits.get(file.path);
@@ -259,31 +321,35 @@ async function completeTurn(turn, baseline) {
   }
 }
 
-async function send(chatId, input, refs = []) {
+async function send(chatId, input, refs = [], externalIds = []) {
   assertIdle();
-  if (!credentials) throw new Error('Подключите ключ Yandex AI Studio в настройках.');
+  if (!credentials) throw new Error('Настройте подключение к Yandex.');
   const text = typeof input === 'string' ? input.trim() : '';
   if (!text || text.length > 40_000) throw new Error('Введите сообщение до 40 000 символов.');
   const context = await resolveContext(store.chat(chatId).cwd, refs);
+  const external = attachments.files(chatId, externalIds);
   assertIdle();
   const chat = store.select(chatId);
   if (chat.archivedAt) throw new Error('Восстановите чат из архива.');
-  const model = lookupModel(chat.modelId ?? legacyModel.id);
-  if (!model || !available.some(item => item.id === model.id)) {
+  const model = available.find(item => item.id === (chat.modelId ?? legacyModel.id));
+  if (!model) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
   const message = {
-    id: store.beginTurn(chatId, text, model.id, context.map(({ path, start, end }) => ({ path, start, end }))),
+    id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
+      ...external.map(({ text, ...item }) => item)]),
     chatId, modelId: model.id,
     role: 'assistant', text: '', tools: [], status: 'running',
   };
   const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
-    approvedEdits: new Map(), fileReads: new Map() };
+    approvedEdits: new Map(), fileReads: new Map(), attachments: store.externalAttachments(chatId) };
   active = turn;
   emit('app:state', snapshot());
   const baseline = await prepareReview(turn);
 
   try {
+    if (turn.stop) return;
+    await attachments.save(chatId, external);
     if (turn.stop) return;
     turn.stage = 'agent';
     emit('app:state', snapshot());
@@ -313,7 +379,8 @@ async function send(chatId, input, refs = []) {
     }
     if (turn.stop) return;
     const result = await turn.client.request('session/prompt', {
-      sessionId: turn.sessionId, prompt: [text, ...context.map(contextPrompt)].map(text => ({ type: 'text', text })),
+      sessionId: turn.sessionId, prompt: [text, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)]
+        .map(text => ({ type: 'text', text })),
     }, 240_000);
     if (result.stopReason === 'cancelled') turn.stop = true;
     if (!turn.stop && !message.text && !turn.tools.size) throw new Error('Алиса вернула пустой ответ.');
@@ -469,6 +536,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
+    attachments = new Attachments(join(app.getPath('userData'), 'context-files'));
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
@@ -500,6 +568,28 @@ if (!app.requestSingleInstanceLock()) {
     bind('project:save-file', (...args) => mutateWorkspace(() => saveEditor(...args)));
     bind('project:diff', (chatId, path, scope) => readProjectDiff(selectedPath(chatId), path, scope));
     bind('project:context', (chatId, path, start, end) => previewContext(selectedPath(chatId), path, start, end));
+    bind('attachment:choose', async (chatId, kind) => {
+      store.chat(chatId);
+      const properties = kind === 'folder' ? ['openDirectory'] : ['openFile', 'multiSelections'];
+      const choice = await dialog.showOpenDialog(window, { properties });
+      return choice.canceled ? null : attachments.choose(chatId, choice.filePaths);
+    });
+    bind('attachment:drop', (chatId, paths) => {
+      store.chat(chatId);
+      return attachments.choose(chatId, paths);
+    });
+    bind('attachment:preview', (...args) => attachments.preview(...args));
+    bind('attachment:attach', (chatId, ...args) => {
+      store.chat(chatId);
+      return attachments.attach(chatId, ...args);
+    });
+    bind('attachment:remove', (chatId, id) => attachments.remove(chatId, [id]));
+    bind('attachment:read', async (chatId, id) => {
+      const item = store.externalAttachments(chatId).find(file => file.id === id);
+      if (!item) throw new Error('Вложение не найдено.');
+      const text = await attachments.read(chatId, [item], attachments.path(chatId, item));
+      return { label: item.label, text: text.slice(0, 20000), truncated: text.length > 20000 };
+    });
     bind('git:stage', (chatId, path, staged) => mutateWorkspace(() => stageFile(selectedPath(chatId), path, staged === true)));
     bind('git:hunks', (chatId, path, scope) => gitHunks(selectedPath(chatId), path, scope));
     bind('git:stage-hunks', (chatId, ...args) => mutateWorkspace(() => stageHunks(selectedPath(chatId), ...args)));
@@ -530,7 +620,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('chat:delete', async id => {
       if (active?.chatId === id || workspaceMutation) throw new Error('Завершите текущую операцию перед удалением.');
       store.deleteChat(id);
-      await removeLocalSessions();
+      await Promise.all([removeLocalSessions(), attachments.removeChat(id)]);
       return snapshot();
     });
     bind('chat:model', (id, modelId) => {
@@ -543,6 +633,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('history:search', (query, includeArchived) => store.search(query, includeArchived));
     bind('settings:layout', value => store.set('layout', JSON.stringify(normalizeLayout(value))));
     bind('settings:models', refreshModels);
+    bind('settings:check-provider', checkConnection);
     bind('chat:send', send);
     bind('chat:stop', stop);
     bind('chat:permission', (id, allow) => resolvePermission(id, allow === true));

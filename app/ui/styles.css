@@ -246,6 +246,25 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 #editor-host .cm-panels { font: 12px/1.4 "Inter", "Segoe UI", sans-serif; }
 #editor-host .cm-panel input { width: auto; }
 .rollback-button { margin-left: 4px; }
+.composer-footer { flex-wrap: wrap; }
+#compose-hint { min-width: 0; }
+.drop-context { position: absolute; inset: 12px; z-index: 1; display: grid; place-items: center; padding: 18px;
+  color: var(--accent-dark); background: #f4edfff2; border: 2px dashed #ae98dc; border-radius: 12px;
+  text-align: center; font-weight: 650; pointer-events: none; }
+.attachment-name { min-width: 0; padding: 3px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px var(--code); }
+.attachment-browser { display: grid; gap: 8px; margin-top: 8px; }
+#attachments-files { max-height: min(37vh, 300px); overflow: auto; padding: 4px; border: 1px solid var(--line); border-radius: 8px; }
+.attachment-choice { display: flex; align-items: center; gap: 7px; padding-left: 5px; }
+.attachment-choice input { width: auto; accent-color: var(--accent); }
+.attachment-choice button { flex: 1; text-align: left; min-width: 0; overflow-wrap: anywhere; padding: 5px; font: 12px var(--code); }
+.attachment-size { flex: none; padding-right: 7px; font-size: 11px; }
+.attachment-directory summary { padding: 4px; cursor: pointer; color: var(--accent-dark); font-size: 12px; }
+.attachment-directory-children { margin-left: 8px; padding-left: 7px; border-left: 1px solid var(--line); }
+.attachment-browser .context-text { max-height: min(24vh, 175px); }
+#attachment-peek-title { overflow-wrap: anywhere; font: 12px var(--code); }
+#attachments-count { margin-right: auto; }
+#settings-dialog { max-height: min(92vh, 800px); }
+#settings-dialog select { width: 100%; padding: 6px 8px; color: inherit; background: #fff; border-radius: 8px; border: 1px solid var(--line); }
 @media (max-width: 1000px) {
   .topbar { padding: 0 15px; }
   .composer-area { padding-right: 14px; padding-left: 14px; }
@@ -253,5 +272,6 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 }
 @media (max-width: 850px) {
   .provider { font-size: 11px; }
-  #compose-hint { visibility: hidden; }
+  #compose-hint { display: none; }
+  #send { margin-left: auto; }
 }

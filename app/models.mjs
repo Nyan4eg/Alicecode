@@ -1,3 +1,5 @@
+import { createProvider, subscriptionMode, subscriptionModelIds } from './providers.mjs';
+
 const modelCatalog = [
   ['qwen3.6-35b-a3b', 'Qwen3.6 35B', 262_144, 'Самая эффективная', 5.79],
   ['yandexgpt-5.1', 'YandexGPT Pro 5.1', 32_768, 'Быстрая альтернатива', 5.94],
@@ -12,6 +14,9 @@ export const models = modelCatalog.map(([id, label, context, badge, medianSecond
 export const lookupModel = id => models.find(model => model.id === id);
 export const defaultModel = lookupModel('qwen3.6-35b-a3b');
 export const legacyModel = lookupModel('aliceai-llm-flash');
+const deepSeekV4 = { id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', context: 1_000_000, badge: 'Подписка' };
+export const subscriptionModels = subscriptionModelIds.map(id => lookupModel(id) ?? deepSeekV4);
+export const modelsFor = mode => mode === subscriptionMode ? subscriptionModels : models;
 
 export function availableModels(entries, folderId) {
   const prefix = `gpt://${folderId}/`;
@@ -20,10 +25,11 @@ export function availableModels(entries, folderId) {
   return models.filter(model => ids.has(model.id));
 }
 
-export async function fetchModels({ folderId, apiKey }) {
-  const response = await fetch('https://ai.api.cloud.yandex.net/v1/models', {
-    headers: { Authorization: `Api-Key ${apiKey}`, 'x-project': folderId },
-    redirect: 'error',
+export async function fetchModels(credentials) {
+  const { folderId, mode } = credentials;
+  if (mode === subscriptionMode) return subscriptionModels;
+  const { response } = await createProvider(credentials).request('/models', {
+    headers: { 'x-project': folderId },
     signal: AbortSignal.timeout(8000),
   });
   if (!response.ok) throw new Error(`Каталог Yandex AI Studio недоступен (HTTP ${response.status}).`);

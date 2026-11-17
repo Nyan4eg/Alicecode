@@ -245,6 +245,12 @@ export class Store {
     return Number(result.lastInsertRowid);
   }
 
+  externalAttachments(chatId) {
+    const rows = this.db.prepare(`SELECT value FROM messages, json_each(messages.attachments)
+      WHERE chatId=? AND json_extract(value, '$.kind')='external'`).all(chatId);
+    return rows.map(row => JSON.parse(row.value));
+  }
+
   messageTool(chatId, messageId, toolId) {
     const row = this.db.prepare("SELECT tools FROM messages WHERE id=? AND chatId=? AND status IN ('done','error','cancelled')")
       .get(messageId, chatId);

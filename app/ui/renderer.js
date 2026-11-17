@@ -7,6 +7,7 @@ const statusLabels = {
 };
 const drafts = new Map();
 const draftContexts = new Map();
+const externalDrafts = new Map();
 const openTools = new Set();
 const expandedFolders = new Set();
 const folderLimits = new Map();
@@ -43,6 +44,9 @@ let chatAction;
 let rollbackTarget;
 let stageTarget;
 let commitTarget;
+let attachmentSelection;
+let attachmentBusy = false;
+const providerLabels = { key: 'AI Studio по API-ключу', subscription: 'Yandex Cloud по подписке' };
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -309,7 +313,15 @@ function renderMessage(message) {
     row.append(formatMessage(message.text));
     if (message.attachments?.length) {
       const context = element('div', 'message-context');
-      for (const item of message.attachments) context.append(fileLink(item.path, contextLabel(item), { line: item.start }));
+      for (const item of message.attachments) {
+        if (item.kind !== 'external') context.append(fileLink(item.path, contextLabel(item), { line: item.start }));
+        else {
+          const file = element('button', 'file-link', item.label);
+          file.type = 'button';
+          file.addEventListener('click', () => openSavedAttachment(message.chatId, item.id));
+          context.append(file);
+        }
+      }
       row.append(context);
     }
     return row;
@@ -368,7 +380,7 @@ function renderComposer() {
   $('permission').hidden = !permission || permission.chatId !== chat?.id;
   renderPermission($('permission').hidden ? null : permission);
   const available = state.models.some(model => model.id === (chat?.modelId ?? state.defaultModel));
-  const notice = !state.configured ? state.credentialError ?? 'Подключите ключ Yandex AI Studio в настройках.'
+  const notice = !state.configured ? state.credentialError ?? 'Выберите и настройте подключение к Yandex.'
     : chat && !available ? 'Модель отсутствует в каталоге. Выберите другую.'
     : '';
   const other = state.chats.find(item => item.id === state.busy && item.id !== chat?.id);
@@ -383,6 +395,7 @@ function renderComposer() {
   noticeNode.hidden = !notice && !other;
   $('prompt').disabled = !state.configured;
   $('attach-file').disabled = !chat || !state.configured || currentContext().length >= 6;
+  $('attach-external').disabled = $('attach-folder').disabled = !canAttach();
   $('send').disabled = !chat || chat.archivedAt || !state.configured || !available || Boolean(state.busy || state.workspaceMutation)
     || sending || !$('prompt').value.trim();
   renderAttachments();
@@ -409,13 +422,13 @@ function renderModels() {
   $('provider').classList.toggle('connected', state.configured);
   const selected = state.models.find(model => model.id === current);
   const time = selected?.medianSeconds?.toLocaleString('ru-RU');
-  picker.title = !state.configured ? 'API-ключ не настроен'
-    : time ? `${selected.label}. Тест на калькуляторе: 3 из 3, медиана ${time} с.`
-      : 'Выбрать модель для этого чата';
-  setText('catalog-status', !state.configured ? 'Сохраните ключ, чтобы загрузить список.'
+  picker.title = !state.configured ? 'Подключение не настроено'
+    : (providerLabels[state.providerMode] ?? '') + (time ? ` · ${selected.label}, тест 3 из 3, медиана ${time} с.` : '');
+  setText('catalog-status', !state.configured ? 'Сохраните подключение, чтобы выбрать модель.'
     : state.catalogStatus === 'loading' ? 'Загружаем модели…'
       : state.catalogStatus === 'error' ? 'Каталог недоступен. Показаны поддерживаемые модели.'
-        : `Совместимых моделей в вашем каталоге: ${state.models.length}.`);
+        : state.catalogStatus === 'documented' ? `Моделей в подписочном каталоге Яндекса: ${state.models.length}.`
+          : `Совместимых моделей в вашем каталоге: ${state.models.length}.`);
   $('refresh-models').disabled = !state.configured || state.catalogStatus === 'loading';
 }
 
@@ -973,7 +986,8 @@ function renderAttachments() {
   const root = $('attachments');
   root.replaceChildren();
   const items = currentContext();
-  root.hidden = items.length === 0;
+  const external = externalDrafts.get(state.activeChat) ?? [];
+  root.hidden = items.length === 0 && external.length === 0;
   items.forEach((item, index) => {
     const chip = element('div', 'attachment');
     const open = element('button', 'quiet', '@ ' + contextLabel(item));
@@ -991,6 +1005,24 @@ function renderAttachments() {
     chip.append(open, remove);
     root.append(chip);
   });
+  for (const item of external) {
+    const chip = element('div', 'attachment');
+    const label = element('span', 'attachment-name', item.label);
+    label.title = item.label;
+    const remove = element('button', 'quiet remove-attachment', '×');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', 'Убрать ' + item.label);
+    remove.addEventListener('click', async () => {
+      const chatId = state.activeChat;
+      try {
+        await api.removeAttachment(chatId, item.id);
+        externalDrafts.set(chatId, (externalDrafts.get(chatId) ?? []).filter(file => file.id !== item.id));
+        renderComposer();
+      } catch (error) { toast(error); }
+    });
+    chip.append(label, remove);
+    root.append(chip);
+  }
 }
 
 function renderFileResults() {
@@ -1289,15 +1321,17 @@ $('model').addEventListener('change', async () => {
 $('settings').addEventListener('click', () => {
   $('settings-form').reset();
   $('settings-error').hidden = true;
-  setText('settings-status', state.configured ? 'Ключ сохранён для вашей учётной записи Windows.'
-    : state.credentialError ?? 'Подключите Alice AI LLM Flash.');
+  $('provider-mode').value = state.providerMode;
+  readSettingsFields();
   $('settings-dialog').showModal();
 });
 $('settings-form').addEventListener('submit', async event => {
   event.preventDefault();
   $('save-settings').disabled = true;
   try {
-    updateState(await api.saveKey({ folderId: $('folder-id').value.trim(), apiKey: $('api-key').value }));
+    updateState(await api.saveKey({ mode: $('provider-mode').value, folderId: $('folder-id').value.trim(),
+      apiKey: $('api-key').value, tokenSource: $('token-source').value,
+      cliProfile: $('cli-profile').value, iamToken: $('iam-token').value }));
     $('settings-form').reset();
     $('settings-dialog').close();
   } catch (error) {
@@ -1335,15 +1369,18 @@ $('composer').addEventListener('submit', async event => {
   if ($('send').disabled || !state.activeChat || !input.trim()) return;
   const chatId = state.activeChat;
   const attachments = currentContext();
+  const files = externalDrafts.get(chatId) ?? [];
   $('prompt').value = '';
   draftContexts.delete(chatId);
+  externalDrafts.delete(chatId);
   sending = true;
   renderComposer();
-  try { await api.send(chatId, input, attachments); }
+  try { await api.send(chatId, input, attachments, files.map(item => item.id)); }
   catch (error) {
     if (state.activeChat === chatId && !$('prompt').value) $('prompt').value = input;
     if (state.activeChat !== chatId && !drafts.get(chatId)) drafts.set(chatId, input);
     if (attachments.length && !draftContexts.get(chatId)?.length) draftContexts.set(chatId, attachments);
+    if (files.length) externalDrafts.set(chatId, [...files, ...(externalDrafts.get(chatId) ?? [])]);
     toast(error);
   } finally {
     sending = false;
@@ -1609,6 +1646,7 @@ $('delete-chat-form').addEventListener('submit', async event => {
     updateState(await api.deleteChat(target.id));
     drafts.delete(target.id);
     draftContexts.delete(target.id);
+    externalDrafts.delete(target.id);
     $('delete-chat-dialog').close();
   } catch (error) { toast(error); }
 });
@@ -1704,6 +1742,194 @@ $('commit-form').addEventListener('submit', async event => {
     setText('commit-error', errorText(error)).hidden = false;
     await loadCommit();
   }
+});
+
+function canAttach() {
+  const chat = activeChat();
+  return Boolean(chat && !chat.archivedAt && !attachmentBusy && (externalDrafts.get(chat.id)?.length ?? 0) < 32);
+}
+
+function selectionCount() {
+  const count = attachmentSelection.selected.size;
+  const current = externalDrafts.get(attachmentSelection.chatId)?.length ?? 0;
+  setText('attachments-count', 'Выбрано ' + count);
+  $('confirm-attachments').disabled = !count || count + current > 32;
+}
+
+function renderAttachmentChoices() {
+  const picker = attachmentSelection;
+  const query = $('attachments-query').value.trim().toLowerCase();
+  const root = $('attachments-files');
+  root.replaceChildren();
+  const groups = new Map([['', root]]);
+  function container(segments) {
+    if (!segments.length) return root;
+    const prefix = segments.join('/');
+    if (!groups.has(prefix)) {
+      const details = element('details', 'attachment-directory');
+      details.open = Boolean(query) || segments.length === 1;
+      details.append(element('summary', '', segments.at(-1)));
+      const children = element('div', 'attachment-directory-children');
+      details.append(children);
+      container(segments.slice(0, -1)).append(details);
+      groups.set(prefix, children);
+    }
+    return groups.get(prefix);
+  }
+  let found = 0;
+  for (const file of picker.items) {
+    if (query && !file.label.toLowerCase().includes(query)) continue;
+    found++;
+    const segments = file.label.split('/');
+    const row = element('div', 'attachment-choice');
+    const input = element('input');
+    input.type = 'checkbox';
+    input.checked = picker.selected.has(file.id);
+    input.disabled = file.tooLarge;
+    input.setAttribute('aria-label', file.label);
+    input.addEventListener('change', () => {
+      if (input.checked) picker.selected.add(file.id);
+      else picker.selected.delete(file.id);
+      selectionCount();
+    });
+    const inspect = element('button', 'quiet', segments.at(-1));
+    inspect.type = 'button';
+    inspect.title = file.label;
+    inspect.disabled = file.tooLarge;
+    inspect.addEventListener('click', () => peekAttachment(picker, file));
+    const size = element('span', 'muted attachment-size', file.tooLarge ? 'Больше 512 КБ'
+      : Math.max(1, Math.ceil(file.size / 1024)) + ' КБ');
+    row.append(input, inspect, size);
+    container(segments.slice(0, -1)).append(row);
+  }
+  if (!found) root.append(element('p', 'muted', 'Подходящих файлов нет.'));
+  selectionCount();
+}
+
+async function peekAttachment(picker, file) {
+  const view = ++picker.preview;
+  setText('attachment-peek-title', file.label);
+  setText('attachment-peek-text', 'Чтение…');
+  $('attachment-peek').hidden = false;
+  try {
+    const result = await api.previewAttachment(picker.chatId, picker.key, file.id);
+    if (attachmentSelection === picker && picker.preview === view) {
+      setText('attachment-peek-text', result.text + (result.truncated ? '\n\n… Показано начало файла.' : ''));
+    }
+  } catch (error) {
+    if (attachmentSelection === picker && picker.preview === view) setText('attachment-peek-text', errorText(error));
+  }
+}
+
+async function pickAttachments(get) {
+  if (!canAttach() || document.querySelector('dialog[open]')) return;
+  const chatId = state.activeChat;
+  attachmentBusy = true;
+  renderComposer();
+  try {
+    const choice = await get(chatId);
+    if (!choice || state.activeChat !== chatId) return;
+    const selected = new Set(choice.items.filter(item => item.individual && !item.tooLarge).map(item => item.id));
+    attachmentSelection = { ...choice, chatId, selected, preview: 0 };
+    $('attachments-query').value = '';
+    $('attachments-query').hidden = choice.items.length < 8;
+    $('attachment-peek').hidden = true;
+    $('attachments-error').hidden = true;
+    setText('attachments-status', choice.truncated ? 'Показаны первые найденные файлы. Для остальных выберите подпапку.'
+      : 'Отметьте файлы, которые Алиса сможет прочитать.');
+    renderAttachmentChoices();
+    $('attachments-dialog').showModal();
+  } catch (error) { toast(error); }
+  finally {
+    attachmentBusy = false;
+    renderComposer();
+  }
+}
+
+async function openSavedAttachment(chatId, id) {
+  try {
+    const file = await api.readAttachment(chatId, id);
+    if (state.activeChat !== chatId || document.querySelector('dialog[open]')) return;
+    setText('saved-attachment-title', file.label);
+    setText('saved-attachment-text', file.text + (file.truncated ? '\n\n… Показано начало файла.' : ''));
+    $('saved-attachment-dialog').showModal();
+  } catch (error) { toast(error); }
+}
+
+function readSettingsFields(reset = true) {
+  const mode = $('provider-mode').value;
+  const saved = state.providerSettings[mode];
+  const subscription = mode === 'subscription';
+  if (reset) {
+    $('folder-id').value = saved?.folderId ?? '';
+    $('token-source').value = saved?.tokenSource ?? 'cli';
+    $('cli-profile').value = saved?.cliProfile ?? '';
+    $('api-key').value = '';
+    $('iam-token').value = '';
+  }
+  const manual = $('token-source').value === 'manual';
+  $('key-auth-fields').hidden = subscription;
+  $('subscription-auth-fields').hidden = !subscription;
+  $('iam-auth-fields').hidden = !manual;
+  $('cli-auth-fields').hidden = manual;
+  $('api-key').placeholder = !subscription && saved ? 'Ключ сохранён' : '';
+  $('iam-token').placeholder = subscription && saved?.tokenSource === 'manual' ? 'Токен сохранён' : '';
+  $('check-provider').disabled = !state.configured || mode !== state.providerMode;
+  $('provider-test-status').hidden = true;
+  setText('settings-status', subscription ? 'Лимиты подписки Yandex Cloud. Используйте каталог облака с подпиской.'
+    : 'Оплата по потреблению через API-ключ.');
+}
+
+$('attach-external').addEventListener('click', () => pickAttachments(id => api.chooseAttachments(id, 'files')));
+$('attach-folder').addEventListener('click', () => pickAttachments(id => api.chooseAttachments(id, 'folder')));
+$('attachments-query').addEventListener('input', renderAttachmentChoices);
+$('attachments-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const picker = attachmentSelection;
+  if ($('confirm-attachments').disabled || picker.chatId !== state.activeChat) return;
+  $('confirm-attachments').disabled = true;
+  $('attachments-error').hidden = true;
+  try {
+    const files = await api.attachFiles(picker.chatId, picker.key, [...picker.selected]);
+    externalDrafts.set(picker.chatId, [...(externalDrafts.get(picker.chatId) ?? []), ...files]);
+    $('attachments-dialog').close();
+    renderComposer();
+    $('prompt').focus();
+  } catch (error) {
+    setText('attachments-error', errorText(error)).hidden = false;
+    selectionCount();
+  }
+});
+const chatDrop = document.querySelector('.conversation');
+const hasFiles = event => event.dataTransfer?.types.includes('Files');
+chatDrop.addEventListener('dragover', event => {
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  if (!state || !canAttach()) return;
+  event.dataTransfer.dropEffect = 'copy';
+  $('drop-context').hidden = false;
+});
+chatDrop.addEventListener('dragleave', event => {
+  if (!chatDrop.contains(event.relatedTarget)) $('drop-context').hidden = true;
+});
+chatDrop.addEventListener('drop', event => {
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  $('drop-context').hidden = true;
+  const files = [...event.dataTransfer.files];
+  if (files.length) void pickAttachments(id => api.dropAttachments(id, files));
+});
+$('provider-mode').addEventListener('change', () => readSettingsFields());
+$('token-source').addEventListener('change', () => readSettingsFields(false));
+$('check-provider').addEventListener('click', async () => {
+  const button = $('check-provider');
+  button.disabled = true;
+  setText('provider-test-status', 'Проверяем активное подключение…').hidden = false;
+  try {
+    await api.checkProvider();
+    setText('provider-test-status', 'Модель ответила. Подключение работает.');
+  } catch (error) { setText('provider-test-status', errorText(error)); }
+  finally { button.disabled = !state.configured || $('provider-mode').value !== state.providerMode; }
 });
 
 api.state().then(updateState).catch(toast);

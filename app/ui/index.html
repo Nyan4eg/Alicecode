@@ -66,6 +66,8 @@
             <div id="attachments" class="attachments" aria-label="Прикреплённые фрагменты" hidden></div>
             <div class="composer-footer">
               <button id="attach-file" class="quiet context-button" type="button" title="Добавить файл или строки в контекст">@ Файл</button>
+              <button id="attach-external" class="quiet context-button" type="button" title="Прикрепить файлы с диска или перетащить их в чат">Файлы</button>
+              <button id="attach-folder" class="quiet context-button" type="button" title="Выбрать файлы из папки">Папка</button>
               <span id="compose-hint">Enter — отправить</span>
               <button id="stop" class="quiet" type="button" hidden>■ Остановить</button>
               <button id="send" class="primary" type="submit" disabled>Отправить <span aria-hidden="true">↑</span></button>
@@ -73,6 +75,7 @@
           </form>
           <div id="notice" class="notice" role="status" hidden></div>
         </div>
+        <div id="drop-context" class="drop-context" hidden>Отпустите файлы, чтобы выбрать вложения</div>
       </section>
       <div id="inspector-grip" class="grip" role="separator" tabindex="0" aria-label="Ширина панели файлов"
         aria-orientation="vertical" title="Перетащите или используйте стрелки. Двойной клик сбрасывает ширину."></div>
@@ -245,19 +248,33 @@
 
   <dialog id="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form">
-      <div class="dialog-header"><h2 id="settings-title">Yandex AI Studio</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <div class="dialog-header"><h2 id="settings-title">Подключение к Yandex</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <label for="provider-mode">Режим</label>
+      <select id="provider-mode"><option value="key">AI Studio по API-ключу</option><option value="subscription">Yandex Cloud по подписке</option></select>
       <p id="settings-status" class="muted"></p>
       <label for="folder-id">ID каталога</label>
       <input id="folder-id" type="text" spellcheck="false" autocomplete="off" required>
-      <label for="api-key">API-ключ</label>
-      <input id="api-key" type="password" autocomplete="off" required>
+      <div id="key-auth-fields">
+        <label for="api-key">API-ключ</label>
+        <input id="api-key" type="password" spellcheck="false" autocomplete="off">
+      </div>
+      <div id="subscription-auth-fields" hidden>
+        <label for="token-source">Авторизация по подписке</label>
+        <select id="token-source"><option value="cli">Профиль Yandex Cloud CLI</option><option value="manual">IAM-токен пользователя</option></select>
+        <div id="cli-auth-fields"><label for="cli-profile">Профиль yc (можно оставить пустым)</label><input id="cli-profile" type="text" spellcheck="false" autocomplete="off"></div>
+        <div id="iam-auth-fields" hidden><label for="iam-token">IAM-токен</label><input id="iam-token" type="password" spellcheck="false" autocomplete="off">
+          <p class="muted">Пользовательский IAM-токен действует до 12 часов.</p>
+        </div>
+      </div>
       <p id="settings-error" class="error" role="alert" hidden></p>
-      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="save-settings" class="primary" type="submit">Сохранить ключ</button></div>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="save-settings" class="primary" type="submit">Сохранить и выбрать</button></div>
     </form>
     <section class="updates" aria-labelledby="catalog-title">
       <strong id="catalog-title">Каталог моделей</strong>
       <p id="catalog-status" class="muted" role="status"></p>
       <button id="refresh-models" class="quiet" type="button">Обновить список</button>
+      <button id="check-provider" class="quiet" type="button" title="Отправляет короткий запрос к активному провайдеру">Проверить подключение</button>
+      <p id="provider-test-status" class="muted" role="status" hidden></p>
     </section>
     <section class="updates" aria-labelledby="updates-title">
       <strong id="updates-title">Обновления Alicecode</strong>
@@ -267,6 +284,32 @@
         <button id="install-update" class="primary" type="button" hidden>Перезапустить и обновить</button>
       </div>
     </section>
+  </dialog>
+
+  <dialog id="attachments-dialog" class="changes-dialog attachments-dialog" aria-labelledby="attachments-title">
+    <form id="attachments-form">
+      <div class="dialog-header"><h2 id="attachments-title">Выбрать вложения</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p id="attachments-status" class="muted" role="status"></p>
+      <input id="attachments-query" type="search" aria-label="Найти файл среди вложений" placeholder="Фильтр по имени или пути" autocomplete="off" hidden>
+      <div class="attachment-browser">
+        <div id="attachments-files"></div>
+        <section id="attachment-peek" aria-label="Просмотр содержимого" hidden>
+          <strong id="attachment-peek-title"></strong>
+          <pre id="attachment-peek-text" class="context-text" tabindex="0"></pre>
+        </section>
+      </div>
+      <p id="attachments-error" class="error" role="alert" hidden></p>
+      <div class="dialog-footer">
+        <span id="attachments-count" class="muted"></span><button class="quiet close-dialog" type="button">Отмена</button>
+        <button id="confirm-attachments" class="primary" type="submit" disabled>Прикрепить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="saved-attachment-dialog" class="changes-dialog" aria-labelledby="saved-attachment-title">
+    <div class="dialog-header"><h2 id="saved-attachment-title">Вложение</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <p class="muted">Сохранённая копия · только чтение</p>
+    <pre id="saved-attachment-text" class="context-text" tabindex="0"></pre>
   </dialog>
 
   <div id="global-error" class="toast" role="alert" hidden></div>

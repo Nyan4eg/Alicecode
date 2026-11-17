@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (name) => (...args) => ipcRenderer.invoke(name, ...args);
 const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(data));
@@ -17,6 +17,15 @@ contextBridge.exposeInMainWorld('alicecode', {
   saveFile: invoke('project:save-file'),
   readDiff: invoke('project:diff'),
   previewContext: invoke('project:context'),
+  chooseAttachments: invoke('attachment:choose'),
+  dropAttachments(chatId, files) {
+    const paths = files.map(file => webUtils.getPathForFile(file)).filter(Boolean);
+    return ipcRenderer.invoke('attachment:drop', chatId, paths);
+  },
+  previewAttachment: invoke('attachment:preview'),
+  attachFiles: invoke('attachment:attach'),
+  removeAttachment: invoke('attachment:remove'),
+  readAttachment: invoke('attachment:read'),
   readReviewFile: invoke('chat:review-file'),
   rollbackPreview: invoke('chat:rollback-preview'),
   rollback: invoke('chat:rollback'),
@@ -40,6 +49,7 @@ contextBridge.exposeInMainWorld('alicecode', {
   replayDetails: invoke('chat:replay-details'),
   replayTest: invoke('chat:replay-test'),
   saveKey: invoke('settings:save'),
+  checkProvider: invoke('settings:check-provider'),
   saveLayout: invoke('settings:layout'),
   refreshModels: invoke('settings:models'),
   checkUpdates: invoke('updates:check'),

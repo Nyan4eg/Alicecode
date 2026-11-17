@@ -4,7 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { alias, modelUri, startAdapter } from './adapter.mjs';
+import { alias, startAdapter } from './adapter.mjs';
 import { defaultModel } from './models.mjs';
 
 export async function startRuntime(home, credentials, model = defaultModel) {
@@ -20,7 +20,7 @@ export async function startRuntime(home, credentials, model = defaultModel) {
       '[cli]', 'auto_update = false',
       '[telemetry]', 'enabled = false',
       '[models]', `default = "${alias}"`,
-      `[model.${alias}]`, `model = "${modelUri(credentials.folderId, model.id)}"`,
+      `[model.${alias}]`, `model = "${adapter.model}"`,
       `base_url = "${adapter.baseUrl}"`, 'env_key = "ALICE_ADAPTER_TOKEN"',
       'api_backend = "chat_completions"', 'temperature = 0', `context_window = ${model.context}`,
     ].join('\n') + '\n');
@@ -29,7 +29,7 @@ export async function startRuntime(home, credentials, model = defaultModel) {
     throw error;
   }
   const env = { ...process.env };
-  for (const name of ['YANDEX_FOLDER_ID', 'YANDEX_API_KEY', 'XAI_API_KEY', 'GROK_CODE_XAI_API_KEY', 'ELECTRON_RUN_AS_NODE']) {
+  for (const name of ['YANDEX_FOLDER_ID', 'YANDEX_API_KEY', 'YC_IAM_TOKEN', 'XAI_API_KEY', 'GROK_CODE_XAI_API_KEY', 'ELECTRON_RUN_AS_NODE']) {
     delete env[name];
   }
   Object.assign(env, {
