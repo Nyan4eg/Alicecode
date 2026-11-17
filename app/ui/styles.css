@@ -458,3 +458,10 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
   .provider { font-size: 11px; }
   .compose-hint { font-size: 10px; }
 }
+.review-note { flex: 1 0 100%; border-top: 1px solid var(--line); padding: 5px 2px; overflow-wrap: anywhere; }
+.review-note summary { cursor: pointer; font-weight: 600; }
+.review-check { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.review-check small { overflow-wrap: anywhere; }
+.check-version { color: var(--muted); font-size: 11px; }
+.check-version.stale { color: #8a471c; font-weight: 600; }
+#review-note-dialog textarea { width: 100%; }

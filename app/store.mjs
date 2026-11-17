@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { defaultModel, legacyModel } from './models.mjs';
+import { diffRange } from './revision.mjs';
 
 const fold = value => value.normalize('NFKC').toLocaleLowerCase('ru').replaceAll('ё', 'е').replace(/\s+/g, ' ');
 
@@ -45,6 +46,12 @@ export class Store {
         beforeText TEXT NOT NULL, afterText TEXT NOT NULL, state TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS managed_edits_message ON managed_edits(messageId, path);
+      CREATE TABLE IF NOT EXISTS review_notes (
+        id INTEGER PRIMARY KEY, chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        origin INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, path TEXT NOT NULL,
+        anchor TEXT NOT NULL, body TEXT NOT NULL, reply INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+        resolved INTEGER NOT NULL DEFAULT 0
+      );
       CREATE TABLE IF NOT EXISTS session_cleanup (sessionId TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS workspace_states (scope TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(scope,id));
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
@@ -334,7 +341,20 @@ export class Store {
     this.db.prepare('UPDATE chats SET sessionId=? WHERE id=?').run(sessionId, chatId);
   }
 
-  beginTurn(chatId, text, modelId = null, attachments = [], mode = 'code') {
+  notes(chatId) {
+    return this.db.prepare('SELECT * FROM review_notes WHERE chatId=? ORDER BY id').all(chatId)
+      .map(note => ({ ...note, anchor: JSON.parse(note.anchor) }));
+  }
+
+  addNote(chatId, origin, path, first, last, body) {
+    if (typeof body !== 'string' || !body.trim() || body.length > 2000) throw Error('Введите замечание до 2000 символов.');
+    const { patch } = this.reviewFile(chatId, origin, path);
+    const anchor = diffRange(patch, first, last);
+    this.db.prepare('INSERT INTO review_notes(chatId,origin,path,anchor,body) VALUES(?,?,?,?,?)')
+      .run(chatId, origin, path, JSON.stringify(anchor), body.trim());
+  }
+
+  beginTurn(chatId, text, modelId = null, attachments = [], mode = 'code', notes = []) {
     this.db.exec('BEGIN');
     try {
       this.db.prepare(`UPDATE chats SET updatedAt=?,
@@ -344,6 +364,11 @@ export class Store {
         .run(chatId, text, JSON.stringify(attachments));
       const message = this.db.prepare("INSERT INTO messages (chatId,role,text,status,modelId,mode) VALUES (?,'assistant','','running',?,?)")
         .run(chatId, modelId, mode);
+      for (const id of notes) {
+        const update = this.db.prepare('UPDATE review_notes SET reply=? WHERE chatId=? AND id=? AND reply IS NULL AND resolved=0')
+          .run(message.lastInsertRowid, chatId, id);
+        if (!update.changes) throw Error('Замечания изменились. Откройте ревью ещё раз.');
+      }
       this.db.exec('COMMIT');
       return Number(message.lastInsertRowid);
     } catch (error) {

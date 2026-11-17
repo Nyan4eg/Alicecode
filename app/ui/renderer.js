@@ -773,6 +773,7 @@ function renderPreview() {
   $('inspector').classList.toggle('reviewing', Boolean(preview || editView));
   renderLayout();
   $('preview-nav').hidden = !preview || preview.mode === 'files' || Boolean(preview.loading || preview.error);
+  $('add-review-note').hidden = preview?.mode !== 'review' || !preview.text;
   if (!preview) return;
   setText('preview-title', preview.path).title = preview.path;
   const mode = preview.mode === 'review' ? 'Изменения за запуск' : preview.mode === 'files' ? 'Файл'
@@ -830,6 +831,7 @@ function renderPreview() {
     const gutter = element('span', 'line-number', label);
     gutter.setAttribute('aria-hidden', 'true');
     row.append(gutter, element('span', '', line), document.createTextNode('\n'));
+    if (preview.mode === 'review') row.dataset.patchIndex = String(body.childElementCount);
     body.append(row);
     if (tone === 'diff-info' && line.startsWith('@@')) {
       row.classList.add('diff-hunk');

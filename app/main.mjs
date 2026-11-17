@@ -28,6 +28,7 @@ import { Attachments } from './attachments.mjs';
 import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
 import { monitoredProvider } from './requests.mjs';
 import { codeQuery } from './code-service.mjs';
+import { checkKind, codeVersion } from './revision.mjs';
 import { inspectFragments, suggestContext, summarize, summaryPrompt } from './conversation-context.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
@@ -76,7 +77,9 @@ function watchAnalysis(root) {
   if (analysisWatchers.has(root)) return;
   try {
     const watcher = watch(root, { recursive: true }, (_event, file) => {
-      if (file && file.split(/[\\/]/).some(part => ['node_modules', '.git', 'dist', 'build', '.venv'].includes(part))) return;
+      if (file && file.split(/[\\/]/).some(part => ['node_modules', '.git', '.venv'].includes(part))) return;
+      emit('checks:changed', root);
+      if (file && file.split(/[\\/]/).some(part => ['dist', 'build'].includes(part))) return;
       staleAnalysis(root);
     }); watcher.on('error', () => {}); analysisWatchers.set(root, watcher);
     if (analysisWatchers.size > 8) { const [old, prior] = analysisWatchers.entries().next().value; prior.close(); analysisWatchers.delete(old); }
@@ -93,6 +96,7 @@ function snapshot() {
     editorStates: store.workspaceStates('editor'),
     projectProfiles: Object.fromEntries(store.snapshot().projects.map(project => [project.id, commandProfile(store.profile(project.id))])),
     commandRuns: store.commands(), taskWorkspaces: store.taskWorkspaces(),
+    reviewNotes: store.notes(store.setting('activeChat') ?? ''),
     apiRequests: store.requests(), analyses: store.analyses(),
     draftFiles: Object.fromEntries([...attachments.drafts].map(([id, files]) => [id, [...files.values()].map(({ text, ...file }) => file)])),
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
@@ -261,11 +265,15 @@ async function requestPermission(turn, params) {
       if (typeof text === 'string') proposed = { ...before, after: text };
     } catch {}
   }
-  return enqueuePermission(turn, details, allow => {
+  const decision = await enqueuePermission(turn, details, allow => {
     if (allow && proposed) turn.approvedEdits.set(proposed.path, proposed);
     const optionId = allow ? permit.optionId : reject?.optionId;
     return optionId ? { outcome: { outcome: 'selected', optionId } } : cancelledPermission();
   });
+  if (decision?.outcome?.optionId === permit.optionId && checkKind(details.command, turn.message.task?.profile)) {
+    turn.checkVersions.set(details.id, await codeVersion(turn.cwd));
+  }
+  return decision;
 }
 
 function resolvePermission(id, allow) {
@@ -391,7 +399,7 @@ async function completeTurn(turn, baseline) {
   }
 }
 
-async function send(chatId, input, refs = [], externalIds = [], resume = null) {
+async function send(chatId, input, refs = [], externalIds = [], resume = null, reviewNotes = []) {
   assertIdle();
   if (!credentials) throw new Error('Настройте подключение к Yandex.');
   const text = typeof input === 'string' ? input.trim() : '';
@@ -415,14 +423,14 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
     source: resume?.source ?? text, steps: resume?.steps?.map(step => ({ ...step, status: step.status === 'done' ? 'done' : 'pending' })) ?? [], status: 'running' };
   const message = {
     id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
-      ...external.map(({ text, ...item }) => item)], chat.mode),
+      ...external.map(({ text, ...item }) => item)], chat.mode, reviewNotes),
     chatId, modelId: model.id, mode: chat.mode, task,
     role: 'assistant', text: '', tools: [], status: 'running',
   };
   const savedWorkspace = store.workspaceStates('chat')[chatId];
-  if (savedWorkspace) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
+  if (savedWorkspace && !reviewNotes.length) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
   const turn = { chatId, mode: chat.mode, approval: chat.approval, abort: new AbortController(), cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
-    approvedEdits: new Map(), fileReads: new Map(), attachments: store.externalAttachments(chatId) };
+    approvedEdits: new Map(), fileReads: new Map(), checkVersions: new Map(), attachments: store.externalAttachments(chatId) };
   active = turn;
   emit('app:state', snapshot());
   const baseline = await prepareReview(turn);
@@ -543,6 +551,7 @@ async function replay(chatId, messageId, toolId, confirmedDirectory) {
     if (turn.stop) return;
     turn.stage = 'test';
     emit('app:state', snapshot());
+    turn.checkVersions = new Map([[tool.id, await codeVersion(chat.cwd)]]);
     const { error, ...result } = await runTest(details, turn.abort.signal);
     Object.assign(tool, result, { status: error ? 'failed' : 'completed', tests: nodeTestCounts(result.output),
       repeatable: !result.interrupted && Number.isInteger(result.exitCode) });
@@ -551,6 +560,7 @@ async function replay(chatId, messageId, toolId, confirmedDirectory) {
     tool.status = 'failed';
     if (!turn.stop) message.error = error.message;
   } finally {
+    commands.recordAgent(turn, tool);
     await completeTurn(turn, baseline);
   }
 }
@@ -899,6 +909,28 @@ if (!app.requestSingleInstanceLock()) {
     bind('git:commit-preview', chatId => commitPreview(selectedPath(chatId)));
     bind('git:commit', (chatId, token, message) => mutateWorkspace(() => createCommit(selectedPath(chatId), token, message)));
     bind('chat:review-file', (chatId, messageId, path) => store.reviewFile(chatId, messageId, path));
+    bind('review:add', (chatId, ...args) => {
+      store.addNote(chatId, ...args);
+      return snapshot();
+    });
+    bind('review:resolve', (chatId, id, resolved) => {
+      store.db.prepare('UPDATE review_notes SET resolved=? WHERE chatId=? AND id=?').run(Number(Boolean(resolved)), chatId, id);
+      return snapshot();
+    });
+    bind('review:send', async chatId => {
+      const notes = store.notes(chatId).filter(note => !note.reply && !note.resolved);
+      if (!notes.length) throw Error('Нет новых замечаний.');
+      if (store.chat(chatId).mode !== 'code') throw Error('Выберите режим «Изменить код».');
+      const prompt = ['Доработай код по замечаниям ревью и проверь результат.', ...notes.map(note =>
+        note.path + ':' + note.anchor.start + '–' + note.anchor.end + (note.anchor.side === 'old' ? ' (удалено)' : '') +
+        '\nФрагмент:\n' + note.anchor.snippet + '\nЗамечание: ' + note.body)].join('\n\n');
+      await send(chatId, prompt, [], [], null, notes.map(note => note.id));
+    });
+    bind('checks:version', async (chatId, original) => {
+      const chat = store.chat(chatId), root = original ? chat.projectCwd : chat.cwd;
+      watchAnalysis(root);
+      return codeVersion(root);
+    });
     bind('chat:rollback-preview', async (chatId, messageId, path) => {
       const { root, result } = await rollbackDetails(chatId, messageId, path);
       const staged = (await listChanges(root)).some(item => item.path === path && item.staged);

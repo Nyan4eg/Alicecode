@@ -10,6 +10,7 @@
   <script defer src="renderer.js"></script>
   <script defer src="workflow.js"></script>
   <script defer src="intelligence.js"></script>
+  <script defer src="review-notes.js"></script>
 </head>
 <body>
   <aside class="sidebar" aria-label="Навигация">
@@ -140,6 +141,7 @@
             <span id="change-position"></span>
             <button id="next-change" class="quiet" type="button" title="Следующее изменение">↓</button>
             <button id="edit-change" class="quiet" type="button">К строке в редакторе</button>
+            <button id="add-review-note" class="quiet" type="button" hidden>Оставить замечание</button>
           </div>
           <div id="preview-git" class="git-actions" hidden>
             <button id="stage-file" class="quiet" type="button"></button>
@@ -414,5 +416,12 @@
   </dialog>
 
   <div id="global-error" class="toast" role="alert" hidden></div>
+  <dialog id="review-note-dialog">
+    <form id="review-note-form">
+      <h2>Замечание к коду</h2><p id="note-location"></p><pre class="context-text" id="note-excerpt"></pre>
+      <label>Что доработать<textarea id="note-body" required maxlength="2000" rows="4"></textarea></label>
+      <div class="dialog-actions"><button type="button" class="close-dialog quiet">Отмена</button><button type="submit">Сохранить замечание</button></div>
+    </form>
+  </dialog>
 </body>
 </html>

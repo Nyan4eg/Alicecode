@@ -28,6 +28,7 @@ function renderWorkflow() {
     if (!message) { host.append(element('p', 'muted', 'Поставьте задачу Алисе. Здесь появятся план, изменённые файлы и результаты проверок.')); return; }
     const plan = renderTask(message, true); host.append(plan);
     const results = element('div', 'task-results');
+    if (typeof renderReviewNotes === 'function') renderReviewNotes(results, message, runs);
     results.append(element('strong', '', message.task.source));
     if (message.error) results.append(element('p', 'error', message.error));
     for (const file of message.review?.files ?? []) results.append(workflowButton(file.path, () => openReview(message, file.path)));
@@ -35,6 +36,7 @@ function renderWorkflow() {
     for (const tool of tests) {
       const result = element('div', tool.exitCode === 0 ? 'test-success' : 'error', (tool.command ?? tool.title) + ' · ' + (tool.tests ? `${tool.tests.passed}/${tool.tests.total} тестов` : `код ${tool.exitCode ?? '—'}`));
       const run = runs.find(run => run.messageId === message.id && run.toolId === tool.id);
+      if (run && !runIsActive(run) && typeof versionBadge === 'function') result.append(versionBadge(run));
       if (run) result.append(workflowButton('Вывод', () => { selectedCommandId = run.id; openWorkflow('commands'); }));
       if (run && !runIsActive(run)) result.append(workflowButton('Повторить', async () => { try { const next = await api.repeatCommand(run.id); selectedCommandId = next.id; mergeCommand(next); openWorkflow('commands'); } catch (error) { toast(error); } }));
       else if (tool.repeatable) result.append(workflowButton('Повторить', () => confirmReplay(message, tool)));
@@ -77,6 +79,7 @@ function renderCommandConsole(runs) {
     $('prompt').dispatchEvent(new Event('input', { bubbles: true })); $('prompt').focus();
   }));
   setText('command-location', run.cwd + ' · ' + (run.source === 'agent' ? 'Алиса' : 'Команда проекта') + (run.error ? ' · ' + run.error : ''));
+  if (typeof versionBadge === 'function' && isCheck(run)) heading.append(versionBadge(run));
   const output = $('command-output'), atEnd = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
   output.textContent = (run.truncated ? '… Начало вывода сокращено\n' : '') + run.output;
   if (atEnd) output.scrollTop = output.scrollHeight;

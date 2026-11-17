@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { stripVTControlCharacters } from 'node:util';
 import { projectEntry } from './workspace.mjs';
 import { nodeTestCounts } from './activity.mjs';
+import { checkKind, codeVersion } from './revision.mjs';
 
 export const commandLabels = { prepare: 'Подготовить ветку', install: 'Зависимости', test: 'Тесты', build: 'Сборка', start: 'Запустить приложение' };
 export function commandProfile(value = {}) {
@@ -50,6 +51,8 @@ export class CommandRuns {
     const run = { id: randomUUID(), chatId: details.chatId, projectId: details.projectId, root: details.root, cwd,
       command, profile, label: commandLabels[details.key] ?? 'Повтор команды', source: 'project', status: 'in_progress',
       startedAt: Date.now(), elapsedMs: 0, output: '', exitCode: null };
+    run.check = checkKind(command, profile, details.key);
+    if (run.check) run.version = await codeVersion(details.root);
     const child = spawn(windows ? 'powershell.exe' : '/bin/sh', windows
       ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', "$ErrorActionPreference = 'Stop'\n[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n$global:LASTEXITCODE = 0\n" + command + '\nexit $LASTEXITCODE'] : ['-c', command],
     { cwd, env, windowsHide: true, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -91,6 +94,8 @@ export class CommandRuns {
       source: 'agent', label: 'Алиса', command: tool.command, output: tool.output ?? '',
       startedAt: prior?.startedAt ?? Date.now(), status: tool.background ? 'background' : tool.interrupted ? 'interrupted' : tool.status,
       exitCode: tool.exitCode, tests: tool.tests };
+    run.check = checkKind(run.command, turn.message.task?.profile);
+    if (run.check) run.version = turn.checkVersions?.get(tool.id) ?? null;
     run.elapsedMs = Date.now() - run.startedAt;
     if (['completed', 'failed', 'interrupted'].includes(run.status)) run.endedAt = Date.now();
     this.save(run);
