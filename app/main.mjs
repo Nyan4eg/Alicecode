@@ -12,7 +12,8 @@ import { discuss } from './discussion.mjs';
 import { consent } from './permissions.mjs';
 import { projectInstructions, saveInstructions, instructionsPrompt } from './instructions.mjs';
 import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
-import { createTaskWorkspace, transferPreview, applyTransfer } from './task-workspace.mjs';
+import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
+import { CommandRuns, commandProfile, commandEnvironment, commandDirectory, commandsPrompt } from './project-commands.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
@@ -34,6 +35,7 @@ app.setPath('userData', devProfile || join(app.getPath('appData'), 'Alicecode'))
 let window;
 let store;
 let attachments;
+let commands;
 let credentials;
 let credentialError;
 let providerMode = keyMode;
@@ -53,6 +55,8 @@ function snapshot() {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
     chatStates: store.workspaceStates('chat'), projectStates: store.workspaceStates('project'),
     editorStates: store.workspaceStates('editor'),
+    projectProfiles: Object.fromEntries(store.snapshot().projects.map(project => [project.id, commandProfile(store.profile(project.id))])),
+    commandRuns: store.commands(), taskWorkspaces: store.taskWorkspaces(),
     draftFiles: Object.fromEntries([...attachments.drafts].map(([id, files]) => [id, [...files.values()].map(({ text, ...file }) => file)])),
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
     workspaceMutation,
@@ -168,6 +172,7 @@ function updateTurn(turn, { sessionId, update }) {
       tool.repeatable = true;
     }
     turn.tools.set(update.toolCallId, tool);
+    commands.recordAgent(turn, tool);
     if (update.status === 'completed' && typeof update.rawOutput?.current_dir === 'string') {
       turn.shellCwd = update.rawOutput.current_dir;
     }
@@ -325,6 +330,7 @@ async function completeTurn(turn, baseline) {
   clearTimeout(turn.stopTimer);
   cancelPermissions(turn);
   turn.client?.close();
+  commands.finishAgent(turn.message.id);
   turn.stage = 'review';
   emit('app:state', snapshot());
   let review;
@@ -363,8 +369,10 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
   const instructionSnapshot = resume?.instructions ?? await projectInstructions(chat.cwd);
+  const profile = commandProfile(store.profile(chat.projectId));
+  const commandEnv = chat.mode === 'code' ? await commandEnvironment(profile) : null;
   assertIdle();
-  const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot,
+  const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot, profile,
     source: resume?.source ?? text, steps: resume?.steps?.map(step => ({ ...step, status: step.status === 'done' ? 'done' : 'pending' })) ?? [], status: 'running' };
   const message = {
     id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
@@ -415,7 +423,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
     if (runtime && runtime.modelId !== model.id) closeRuntime();
     runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model);
     if (turn.stop) return;
-    turn.client = new AcpClient(chat.cwd, runtime, {
+    turn.client = new AcpClient(chat.cwd, { ...runtime, env: { ...runtime.env, ...(commandEnv ? Object.fromEntries(Object.entries(commandEnv).filter(([key]) => key.toLowerCase() === 'path')) : {}) } }, {
       onUpdate: update => updateTurn(turn, update),
       onPermission: params => requestPermission(turn, params),
       onRequest: (method, params) => fileRequest(turn, method, params),
@@ -438,7 +446,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
     }
     if (turn.stop) return;
     const discussion = store.db.prepare("SELECT text FROM messages WHERE chatId=? AND mode='discuss' AND role='assistant' AND status='done' ORDER BY id DESC LIMIT 1").get(chatId)?.text;
-    const common = [instructionText, referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)];
+    const common = [instructionText, commandsPrompt(profile, chat.cwd), referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)];
     const run = async text => {
       const length = message.text.length, count = turn.tools.size;
       const result = await turn.client.request('session/prompt', { sessionId: turn.sessionId,
@@ -456,7 +464,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
       message.text += `\n\n### Шаг ${index + 1}. ${step.title}\n\n`;
       await run('Задача: ' + task.source + '\nПлан: ' + task.steps.map((s, i) => `${i + 1}. ${s.title} (${s.status})`).join('\n')
         + `\nВыполни сейчас только шаг ${index + 1}: ${step.title}. Дождись завершения команд. Сообщи фактический результат. `
-        + (step.kind === 'test' ? 'Обязательно запусти тесты и дождись их кода выхода; не выдавай предположение за выполненную проверку.' : 'Не переходи к следующему шагу самостоятельно.'));
+        + (step.kind === 'test' ? 'Обязательно запусти тесты и дождись их кода выхода; не выдавай предположение за выполненную проверку.' : 'Не переходи к следующему шагу самостоятельно. Приложение продолжит план автоматически; подтверждение пользователя для перехода не запрашивай.'));
       if (turn.stop) { step.status = 'stopped'; publishTurn(turn); break; }
       const actions = [...turn.tools.values()].filter(tool => !before.has(tool.id));
       if (!finishStep(step, actions, turn.stop ? 'Остановлено пользователем.' : null)) throw new Error(step.note);
@@ -612,6 +620,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
+    commands = new CommandRuns(store, run => emit('command:run', run));
     attachments = await Attachments.open(join(app.getPath('userData'), 'context-files'));
     attachments.drafts = new Map(store.draftFiles().map(([id, files]) => [id, new Map(files.map(file => [file.id, file]))]));
     attachments.persistDraft = (id, files) => store.saveDraftFiles(id, files);
@@ -623,6 +632,56 @@ if (!app.requestSingleInstanceLock()) {
       if (chat.archivedAt) throw new Error('Восстановите чат из архива.');
       return chat;
     };
+    const workspaceHome = join(app.getPath('userData'), 'task-workspaces');
+    const registryWorkspace = id => {
+      const workspace = store.taskWorkspaces().find(item => item.id === id);
+      if (!workspace) throw new Error('Рабочая папка задачи не найдена.');
+      return workspace;
+    };
+    const assertWorkspaceStopped = workspace => {
+      if (active?.cwd === workspace.root || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) throw new Error('Сначала остановите задачу и команды в этой рабочей папке.');
+      if (store.workspaceStates('editor')[workspace.id]?.files?.some(file => file.dirty)) throw new Error('В редакторе задачи есть несохранённые файлы. Сохраните их перед очисткой.');
+    };
+    bind('project:commands', (id, value) => {
+      const chat = taskChat(id); if (active?.chatId === id) throw new Error('Завершите задачу перед изменением команд.');
+      store.saveProfile(chat.projectId, commandProfile(value)); return snapshot();
+    });
+    bind('command:start', async (id, key, original = false) => {
+      const chat = taskChat(id);
+      const run = await commands.start({ chatId: id, projectId: chat.projectId, root: original ? chat.projectCwd : chat.cwd, profile: store.profile(chat.projectId), key });
+      return run;
+    });
+    bind('command:stop', id => {
+      const run = store.command(id); if (!run) throw new Error('Команда не найдена.');
+      if (run.source === 'agent') {
+        if (active?.message.id !== run.messageId) throw new Error('Этот запуск агента уже завершён.');
+        stop();
+      } else commands.stop(id);
+    });
+    bind('command:repeat', async id => {
+      const run = store.command(id); if (!run || ['pending', 'in_progress', 'background'].includes(run.status)) throw new Error('Команда ещё выполняется.');
+      const chat = taskChat(run.chatId);
+      const root = await realpath(run.root);
+      const cwd = relative(root, await realpath(run.cwd)).replaceAll('\\', '/');
+      return commands.start({ chatId: chat.id, projectId: chat.projectId, root, cwd: cwd || '.', command: run.command, profile: run.profile ?? store.profile(chat.projectId) });
+    });
+    bind('workspace:list', async () => Promise.all(store.taskWorkspaces().map(async workspace => {
+      try {
+        const details = await taskWorkspaceDetails(workspace, workspaceHome);
+        if (active?.cwd === workspace.root || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) return { ...details, removable: false, note: 'В этой папке выполняется задача или команда.' };
+        return details;
+      } catch (error) { return { ...workspace, removable: false, note: error.message }; }
+    })));
+    bind('workspace:remove', id => mutateState(async () => {
+      const workspace = registryWorkspace(id); assertWorkspaceStopped(workspace);
+      const removed = await removeTaskWorkspace(workspace, workspaceHome);
+      store.saveTaskWorkspace(id, workspace.projectId, workspace.chatId, removed);
+    }));
+    bind('workspace:reveal', async id => {
+      const workspace = registryWorkspace(id); const location = await realpath(workspace.directory);
+      if (relative(await realpath(workspaceHome), dirname(location)) || location !== workspace.directory) throw new Error('Папка задачи перемещена.');
+      return shell.openPath(location);
+    });
     bind('task:options', (id, value) => {
       if (active?.chatId === id) throw new Error('Завершите задачу перед сменой режима.');
       taskChat(id); store.setTaskOptions(id, value); return snapshot();
@@ -654,9 +713,17 @@ if (!app.requestSingleInstanceLock()) {
     }));
     bind('task:transfer-preview', async id => {
       const result = await transferPreview(taskChat(id).workspace);
-      return { token: result.token, conflict: result.conflict, files: result.files.map(({ path, patch, conflict, current, text }) => ({ path, patch, conflict, changed: !conflict && current.text !== text })) };
+      return { token: result.token, conflict: result.conflict, files: result.files.map(({ path, patch, conflict, current, text, desired, base, resolvable }) => ({ path, patch, conflict, current: current?.text, desired, base, merged: text, resolvable, changed: !conflict && current?.text !== text })) };
     });
-    bind('task:transfer', (id, token) => mutateWorkspace(() => applyTransfer(taskChat(id).workspace, token)));
+    bind('task:transfer', (id, token, selection = null, resolutions = {}) => mutateWorkspace(async () => {
+      const chat = taskChat(id), workspace = chat.workspace;
+      const before = await transferPreview(workspace);
+      const files = await applyTransfer(workspace, token, selection, resolutions);
+      const transferred = { ...workspace.transferred };
+      for (const file of before.files.filter(file => !selection || selection.includes(file.path))) if (file.desiredStamp !== undefined) transferred[file.path] = file.desiredStamp;
+      store.saveTaskWorkspace(id, chat.projectId, id, { ...workspace, transferred, transferredAt: Date.now() });
+      return files;
+    }));
     bind('task:resume', (id, messageId) => {
       const task = store.task(id, messageId);
       if (taskChat(id).mode !== 'code') throw new Error('Переключите чат в режим «Изменить код», чтобы продолжить план.');
@@ -755,7 +822,7 @@ if (!app.requestSingleInstanceLock()) {
       return snapshot();
     });
     bind('chat:delete', async id => {
-      if (active?.chatId === id || workspaceMutation) throw new Error('Завершите текущую операцию перед удалением.');
+      if (active?.chatId === id || workspaceMutation || [...commands.active.values()].some(entry => entry.run.chatId === id)) throw new Error('Завершите текущую операцию и команды перед удалением.');
       store.deleteChat(id);
       await Promise.all([removeLocalSessions(), attachments.removeChat(id)]);
       return snapshot();
@@ -806,7 +873,13 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', () => {
+let stoppingCommands = false;
+app.on('before-quit', event => {
+  if (commands?.active.size && !stoppingCommands) {
+    event.preventDefault(); stoppingCommands = true;
+    void commands.close().finally(() => app.quit());
+    return;
+  }
   if (active) {
     active.stop = true;
     active.abort?.abort();

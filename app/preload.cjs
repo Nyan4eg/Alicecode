@@ -5,6 +5,14 @@ const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(da
 
 contextBridge.exposeInMainWorld('alicecode', {
   state: invoke('app:state'),
+  saveProjectCommands: invoke('project:commands'),
+  startCommand: invoke('command:start'),
+  stopCommand: invoke('command:stop'),
+  repeatCommand: invoke('command:repeat'),
+  onCommand: subscribe('command:run'),
+  taskWorkspaces: invoke('workspace:list'),
+  removeTaskWorkspace: invoke('workspace:remove'),
+  revealTaskWorkspace: invoke('workspace:reveal'),
   taskOptions: invoke('task:options'),
   instructions: invoke('project:instructions'),
   saveInstructions: invoke('project:save-instructions'),

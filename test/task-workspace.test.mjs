@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { gitIn } from '../app/workspace.mjs';
-import { createTaskWorkspace, transferPreview, applyTransfer } from '../app/task-workspace.mjs';
+import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from '../app/task-workspace.mjs';
+import { Store } from '../app/store.mjs';
 
 test('a task branch includes staged and unstaged on-disk context, preserves the original index, and transfers only task edits with conflicts checked', async () => {
   const root = await mkdtemp(join(tmpdir(), 'alicecode-task-'));
@@ -97,5 +98,41 @@ test('nested task roots transfer empty files and refuse transfer after switching
   } finally {
     if (workspace) await gitIn(workspace.sourceRepo, ['worktree', 'remove', '--force', workspace.directory]);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('manual conflict resolutions and selected transfers retain the index, refuse stale previews, and keep orphan branches manageable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'alicecode-resolve-')), repo = join(root, 'repo'), home = join(root, 'tasks');
+  let workspace, store;
+  try {
+    await mkdir(repo); await gitIn(repo, ['init', '-q']); await gitIn(repo, ['config', 'user.name', 'QA']); await gitIn(repo, ['config', 'user.email', 'qa@example.test']);
+    await writeFile(join(repo, 'code.js'), 'const value = 1;\n'); await gitIn(repo, ['add', '.']); await gitIn(repo, ['commit', '-qm', 'base']);
+    store = new Store(join(root, 'profile.sqlite')); const chat = store.addProject('Web', repo);
+    workspace = await createTaskWorkspace(repo, home, chat.id, 'alice/resolve'); store.setTaskWorkspace(chat.id, workspace);
+    await writeFile(join(workspace.root, 'code.js'), 'const value = 2;\n'); await writeFile(join(workspace.root, 'later.txt'), 'later\n');
+    await writeFile(join(repo, 'code.js'), 'const value = 3;\n');
+    const index = await readFile(join(repo, '.git', 'index')), preview = await transferPreview(workspace);
+    assert.equal(preview.files.find(file => file.path === 'code.js').resolvable, true);
+    assert.equal((await taskWorkspaceDetails(workspace, home)).removable, false);
+    await assert.rejects(applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': preview.files[0].conflict }), /маркеры/);
+    await applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': 'const value = 5; // combined\n' });
+    assert.equal(await readFile(join(repo, 'code.js'), 'utf8'), 'const value = 5; // combined\n');
+    await assert.rejects(readFile(join(repo, 'later.txt')));
+    assert.deepEqual(await readFile(join(repo, '.git', 'index')), index);
+    await assert.rejects(applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': 'stale\n' }), /изменились/);
+    const remaining = await transferPreview(workspace);
+    await applyTransfer(workspace, remaining.token, ['later.txt']);
+    workspace.transferred = Object.fromEntries(remaining.files.map(file => [file.path, file.desiredStamp]));
+    store.saveTaskWorkspace(chat.id, chat.projectId, chat.id, workspace);
+    store.deleteChat(chat.id); assert.equal(store.taskWorkspaces()[0].chatId, null);
+    assert.equal((await taskWorkspaceDetails(workspace, home)).removable, true);
+    const removed = await removeTaskWorkspace(workspace, home); workspace = null;
+    store.saveTaskWorkspace(chat.id, chat.projectId, null, removed);
+    assert.equal(store.taskWorkspaces()[0].state, 'removed');
+    assert.ok((await gitIn(repo, ['branch', '--list', 'alice/resolve'])).includes('alice/resolve'));
+    assert.deepEqual(await readFile(join(repo, '.git', 'index')), index);
+  } finally {
+    if (workspace) await gitIn(repo, ['worktree', 'remove', '--force', workspace.directory]);
+    store?.db.close(); await rm(root, { recursive: true, force: true });
   }
 });

@@ -48,11 +48,20 @@ export class Store {
       CREATE TABLE IF NOT EXISTS session_cleanup (sessionId TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS workspace_states (scope TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(scope,id));
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS project_profiles (projectId TEXT PRIMARY KEY REFERENCES projects(id), data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS command_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_workspaces (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, chatId TEXT, data TEXT NOT NULL);
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
     this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'",
       approval: "TEXT NOT NULL DEFAULT 'ask'", planning: 'INTEGER NOT NULL DEFAULT 0', draftPlan: 'TEXT', workspace: 'TEXT' });
     this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'", task: 'TEXT' });
+    for (const row of this.db.prepare('SELECT id,projectId,workspace FROM chats WHERE workspace IS NOT NULL').all()) {
+      this.db.prepare('INSERT OR IGNORE INTO task_workspaces VALUES (?,?,?,?)').run(row.id, row.projectId, row.id, row.workspace);
+    }
+    for (const run of this.commands().filter(run => ['pending', 'in_progress', 'background'].includes(run.status))) {
+      this.saveCommand({ ...run, status: 'interrupted', error: 'Перезапуск приложения: состояние процесса не подтверждено.', endedAt: Date.now() });
+    }
     for (const row of this.db.prepare("SELECT id,task FROM messages WHERE task IS NOT NULL AND status='cancelled'").all()) {
       const task = JSON.parse(row.task);
       if (['running', 'planning'].includes(task.status)) {
@@ -119,8 +128,25 @@ export class Store {
   }
 
   setTaskWorkspace(id, workspace) {
-    this.chat(id);
+    const chat = this.chat(id);
     this.db.prepare('UPDATE chats SET workspace=?,sessionId=NULL WHERE id=?').run(JSON.stringify(workspace), id);
+    this.saveTaskWorkspace(id, chat.projectId, id, workspace);
+  }
+
+  profile(projectId) { return JSON.parse(this.db.prepare('SELECT data FROM project_profiles WHERE projectId=?').get(projectId)?.data ?? '{}'); }
+  saveProfile(projectId, profile) {
+    if (!this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId)) throw new Error('Проект не найден.');
+    this.db.prepare('INSERT INTO project_profiles VALUES (?,?) ON CONFLICT(projectId) DO UPDATE SET data=excluded.data').run(projectId, JSON.stringify(profile));
+  }
+  command(id) { const row = this.db.prepare('SELECT data FROM command_runs WHERE id=?').get(id); return row ? JSON.parse(row.data) : null; }
+  commands() { return this.db.prepare('SELECT data FROM command_runs ORDER BY rowid DESC LIMIT 500').all().map(row => JSON.parse(row.data)); }
+  saveCommand(run) { this.db.prepare('INSERT INTO command_runs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(run.id, JSON.stringify(run)); }
+  taskWorkspaces() { return this.db.prepare('SELECT * FROM task_workspaces ORDER BY rowid DESC').all().map(({ data, ...row }) => ({ ...row, ...JSON.parse(data) })); }
+  saveTaskWorkspace(id, projectId, chatId, workspace) {
+    this.db.prepare('INSERT INTO task_workspaces VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,chatId=excluded.chatId')
+      .run(id, projectId, chatId, JSON.stringify(workspace));
+    if (workspace.state === 'removed') this.db.prepare('UPDATE chats SET workspace=NULL,sessionId=NULL WHERE id=?').run(id);
+    else this.db.prepare('UPDATE chats SET workspace=? WHERE id=?').run(JSON.stringify(workspace), id);
   }
 
   task(chatId, messageId) {
@@ -174,7 +200,7 @@ export class Store {
       FROM chats JOIN projects ON projects.id=chats.projectId WHERE chats.id=?`).get(id);
     if (!chat) throw new Error('Чат не найден.');
     const workspace = chat.workspace ? JSON.parse(chat.workspace) : null;
-    return { ...chat, projectCwd: chat.cwd, cwd: workspace?.root ?? chat.cwd, workspace,
+    return { ...chat, projectCwd: chat.cwd, cwd: workspace?.state === 'removed' ? chat.cwd : workspace?.root ?? chat.cwd, workspace,
       draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null };
   }
 
@@ -243,6 +269,7 @@ export class Store {
       this.db.prepare("DELETE FROM workspace_states WHERE scope='chat' AND id=?").run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='editor' AND id=?").run(id);
       this.db.prepare('DELETE FROM chats WHERE id=?').run(id);
+      this.db.prepare('UPDATE task_workspaces SET chatId=NULL WHERE chatId=?').run(id);
       this.leaveChat(chat);
       if (chat.sessionId && !this.db.prepare('SELECT 1 FROM chats WHERE sessionId=?').get(chat.sessionId)) {
         this.db.prepare('INSERT OR IGNORE INTO session_cleanup VALUES (?)').run(chat.sessionId);

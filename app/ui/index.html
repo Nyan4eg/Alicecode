@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="styles.css">
   <script defer src="editor.bundle.js"></script>
   <script defer src="renderer.js"></script>
+  <script defer src="workflow.js"></script>
 </head>
 <body>
   <aside class="sidebar" aria-label="Навигация">
@@ -157,7 +158,31 @@
         </section>
       </aside>
     </div>
+    <section id="task-drawer" class="task-drawer" hidden aria-label="Задача и команды">
+      <div class="drawer-heading"><div class="drawer-tabs"><button id="drawer-task-tab" class="quiet" type="button">Задача</button><button id="drawer-commands-tab" class="quiet" type="button">Команды</button></div><span id="drawer-caption"></span><button id="close-drawer" class="quiet icon" type="button" aria-label="Скрыть панель">×</button></div>
+      <div id="task-overview" class="task-overview"></div>
+      <div id="command-console" class="command-console" hidden>
+        <div class="command-sidebar"><div id="command-launchers" class="command-launchers"></div><div id="command-history" class="command-history"></div></div>
+        <div class="command-detail"><div id="command-heading" class="command-heading"></div><div id="command-location" class="command-location"></div><div id="command-links" class="command-links"></div><pre id="command-output" tabindex="0"></pre></div>
+      </div>
+    </section>
+    <footer class="workbench-status"><button id="show-task" class="quiet" type="button">Задача</button><button id="show-commands" class="quiet" type="button">Команды</button><span id="task-live-status" role="status"></span><button id="project-command-settings" class="quiet" type="button">Команды проекта…</button><button id="manage-task-branches" class="quiet" type="button">Ветки…</button></footer>
   </main>
+
+  <dialog id="commands-dialog" class="changes-dialog" aria-labelledby="commands-title">
+    <form id="commands-form"><div class="dialog-header"><h2 id="commands-title">Команды проекта</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+      <p class="muted">Настройки общие для чатов проекта. Команды выполняются в выбранной рабочей папке; отдельная ветка использует свою копию проекта. Алиса получает эти команды как контекст задачи.</p>
+      <div class="profile-environment"><label>Рабочая папка внутри проекта<input id="command-directory" placeholder="Например, backend или ."></label><label>Путь к интерпретатору<input id="command-runtime" placeholder="Необязательно: C:\\Program Files\\nodejs\\node.exe"></label></div>
+      <p class="muted">Каталог выбранного интерпретатора добавляется в начало PATH. В Windows команды выполняются через PowerShell. Команда подготовки ветки запускается кнопкой «Подготовить ветку».</p>
+      <div id="command-settings-fields"></div><p id="commands-error" class="error" hidden></p>
+      <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Сохранить команды</button></div>
+    </form>
+  </dialog>
+  <dialog id="branches-dialog" class="changes-dialog" aria-labelledby="branches-title">
+    <div class="dialog-header"><h2 id="branches-title">Рабочие папки задач</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <p class="muted">Завершение удаляет рабочую папку задачи вместе с зависимостями. Git-ветка сохраняется. Неперенесённые изменения блокируют очистку; удаление чата само по себе не удаляет код.</p>
+    <div id="branch-list" class="branch-list"></div><p id="branches-error" class="error" hidden></p>
+  </dialog>
 
   <dialog id="instructions-dialog" class="changes-dialog" aria-labelledby="instructions-title">
     <form id="instructions-form"><div class="dialog-header"><h2 id="instructions-title">Инструкции проекта</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>

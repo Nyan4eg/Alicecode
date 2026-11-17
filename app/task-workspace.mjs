@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, readdir, lstat } from 'node:fs/promises';
 import { join, resolve, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { gitIn, gitPrefix } from './workspace.mjs';
 import { repositoryRoot } from './git.mjs';
 import { finishReview } from './review.mjs';
-import { editableFile, editDiff, fingerprint, mergeText, removeChecked, textForDisk, writeChecked } from './editing.mjs';
+import { editableFile, editDiff, fingerprint, mergeText, removeChecked, textForDisk, validateText, writeChecked } from './editing.mjs';
 
 export async function createTaskWorkspace(source, home, id, branch) {
   if (!/^[a-f0-9-]{36}$/.test(id) || typeof branch !== 'string' || !/^[a-zA-Z][a-zA-Z0-9_./-]{0,100}$/.test(branch)) throw new Error('Введите допустимое имя ветки.');
@@ -60,7 +60,8 @@ export async function transferPreview(workspace) {
       const base = await baseText(workspace, change.path);
       const desired = await editableFile(workspace.root, change.path, true);
       const current = await editableFile(workspace.originalRoot, change.path, true);
-      Object.assign(item, { current, desiredStamp: desired.stamp });
+      Object.assign(item, { current, desiredStamp: desired.stamp, base, desired: desired.text,
+        resolvable: current.text !== null && desired.text !== null });
       if (base === null) {
         if (current.text !== null && current.text !== desired.text) throw new Error('Файл с таким именем уже появился в исходном проекте.');
         item.text = desired.text;
@@ -80,12 +81,23 @@ export async function transferPreview(workspace) {
   return { token, files, conflict: files.some(file => file.conflict) };
 }
 
-export async function applyTransfer(workspace, token) {
+export async function applyTransfer(workspace, token, selection = null, resolutions = {}) {
   const preview = await transferPreview(workspace);
-  if (preview.token !== token || preview.conflict) throw new Error('Файлы изменились или найден конфликт. Проверьте перенос заново.');
+  if (preview.token !== token) throw new Error('Файлы изменились или найден конфликт. Проверьте перенос заново.');
+  const selected = selection === null ? preview.files : preview.files.filter(file => selection.includes(file.path));
+  if (!Array.isArray(selection ?? []) || selection && (!selection.length || new Set(selection).size !== selection.length || selected.length !== selection.length)) throw new Error('Выберите файлы из текущего сравнения.');
+  for (const file of selected) {
+    if (file.conflict) {
+      const resolution = resolutions[file.path];
+      if (!file.resolvable || typeof resolution !== 'string') throw new Error('Сначала разрешите конфликт: ' + file.path);
+      validateText(resolution);
+      if (/^(<<<<<<< |\|\|\|\|\|\|\| |=======$|>>>>>>> )/m.test(resolution)) throw new Error('В результате остались маркеры конфликта: ' + file.path);
+      file.text = textForDisk(file.current.text, resolution);
+    }
+  }
   const applied = [];
   try {
-    for (const file of preview.files) {
+    for (const file of selected) {
       if (file.text === file.current.text) continue;
       if (file.text === null) await removeChecked(workspace.originalRoot, file.current);
       else await writeChecked(workspace.originalRoot, file.current, file.text);
@@ -104,4 +116,43 @@ export async function applyTransfer(workspace, token) {
     throw new Error(error.message + (retained.length ? ' Частично перенесены: ' + retained.join(', ') : ' Перенос отменён.'));
   }
   return applied.map(file => file.path);
+}
+
+export async function taskWorkspaceDetails(workspace, home) {
+  const parent = await realpath(home);
+  if (workspace.state === 'removed') return { ...workspace, exists: false, removable: false };
+  const folder = await realpath(workspace.directory).catch(() => null);
+  if (!folder || dirnameOf(folder) !== parent || !/^[a-f0-9-]{36}$/.test(folder.slice(parent.length + 1))) return { ...workspace, exists: Boolean(folder), removable: false, note: 'Папка задачи отсутствует или находится вне профиля.' };
+  const branch = (await gitIn(folder, ['branch', '--show-current'])).trim();
+  if (branch !== workspace.branch) return { ...workspace, exists: true, removable: false, note: 'В рабочей папке выбрана другая ветка.' };
+  let bytes = 0, count = 0, incomplete = false;
+  const scan = async path => {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      if (++count > 30000) { incomplete = true; return; }
+      const file = join(path, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) await scan(file); else bytes += (await lstat(file)).size;
+      if (incomplete) return;
+    }
+  };
+  await scan(folder);
+  let pending = true, note;
+  try {
+    const preview = await transferPreview(workspace);
+    pending = preview.files.some(file => {
+      const transferred = workspace.transferred?.[file.path];
+      const confirmed = Object.hasOwn(workspace.transferred ?? {}, file.path) && transferred === file.desiredStamp;
+      return !confirmed && (file.conflict || file.text !== file.current?.text);
+    });
+    if (pending) note = 'Есть неперенесённые изменения. Сначала перенесите результат.';
+  } catch (error) { note = error.message; }
+  return { ...workspace, exists: true, bytes, incomplete, removable: !pending, note };
+}
+function dirnameOf(path) { return resolve(path, '..'); }
+export async function removeTaskWorkspace(workspace, home) {
+  const details = await taskWorkspaceDetails(workspace, home);
+  if (!details.removable) throw new Error(details.note ?? 'Рабочую папку нельзя удалить.');
+  // Git owns removal; only the validated task directory under this profile may be removed.
+  await gitIn(workspace.sourceRepo, ['worktree', 'remove', '--force', workspace.directory], { timeout: 120000 });
+  return { ...workspace, state: 'removed', removedAt: Date.now() };
 }

@@ -578,6 +578,7 @@ function updateState(next) {
   renderThread(changed);
   renderUpdates();
   renderEditorTabs();
+  if (typeof renderWorkflow === 'function') { if (changed) restoreWorkflow(chatViews.get(state.activeChat)?.workflow); renderWorkflow(); }
   if (changed || previous?.busy && !state.busy || previous?.workspaceMutation && !state.workspaceMutation) refreshWorkspace();
   else if (!previous) renderWorkspace();
   if (changed) void restoreWorkspace(chatViews.get(state.activeChat) ?? {});
@@ -1321,6 +1322,7 @@ api.onMessage(message => {
   const scroll = atBottom();
   state.messages[index] = message;
   document.querySelector(`[data-message-id="${message.id}"]`)?.replaceWith(renderMessage(message));
+  if (typeof renderWorkflow === 'function') renderWorkflow();
   if (scroll) scrollBottom();
 });
 
@@ -2039,6 +2041,7 @@ function workspaceValues() {
   const value = { draft: $('prompt').value, context: currentContext(), view: {
     tab, scrollTop: $('thread').scrollTop, atBottom: atBottom(), reviewMessageId: review?.messageId,
     editorPath: editView?.path,
+    workflow: typeof workflowView === 'function' ? workflowView() : undefined,
     preview: preview ? { path: preview.path, mode: preview.mode, line: preview.line, scope: preview.scope,
       messageId: preview.messageId, hunkIndex: preview.hunkIndex } : null,
   } };
@@ -2128,7 +2131,7 @@ $('content-query').addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); clearTimeout(contentTimer); void runContentSearch(); }
 });
 
-function renderTask(message) {
+function renderTask(message, expanded = false) {
   const task = message.task;
   const panel = element('section', 'task-card');
   const head = element('div', 'task-heading');
@@ -2136,6 +2139,13 @@ function renderTask(message) {
   if (task.approval === 'bypass' && message.mode === 'code') head.append(element('span', 'bypass-badge', 'Bypass'));
   if (task.workspace) head.append(element('span', 'task-branch-label', task.workspace.branch));
   panel.append(head);
+  if (!expanded) {
+    const done = task.steps.filter(step => step.status === 'done').length;
+    const labels = { done: 'Готово', running: 'Выполняется', planning: 'Составляем план', stopped: 'Остановлено', error: 'Ошибка' };
+    const show = element('button', 'quiet', (labels[task.status] ?? task.status) + (task.steps.length ? ` · шаги ${done}/${task.steps.length}` : '') + ' · Открыть задачу');
+    show.type = 'button'; show.addEventListener('click', () => { workflowTaskId = message.id; openWorkflow('task'); }); panel.append(show);
+    return panel;
+  }
   if (task.steps.length) {
     const steps = element('ol', 'task-steps');
     const labels = { pending: 'Ожидает', running: 'Выполняется', done: 'Готово', error: 'Ошибка', stopped: 'Остановлено' };
@@ -2241,30 +2251,11 @@ $('task-branch-form').addEventListener('submit', async event => {
   finally { $('confirm-task-branch').disabled = false; }
 });
 async function showTransfer() {
-  transferTarget = { chatId: state.activeChat, token: null };
-  const target = transferTarget;
-  $('apply-task-transfer').disabled = true; $('transfer-files').replaceChildren();
-  setText('transfer-note', 'Сравниваем результат с исходным проектом…'); $('task-transfer-dialog').showModal();
-  try {
-    const result = await api.transferPreview(target.chatId);
-    if (target !== transferTarget) return;
-    target.token = result.token;
-    setText('transfer-note', result.conflict ? 'Есть конфликт. Исходные файлы не будут перезаписаны.'
-      : result.files.length ? 'Переносится разница от начального снимка задачи. Индекс Git исходного проекта сохраняется.' : 'Изменений задачи нет.');
-    for (const file of result.files) {
-      const group = element('details', 'transfer-file'); group.open = Boolean(file.conflict);
-      group.append(element('summary', file.conflict ? 'error' : '', file.path + (file.conflict ? ' · конфликт' : '')),
-        element('pre', 'context-text', file.conflict ?? (file.patch || (file.changed ? 'Создание или удаление пустого файла.' : 'Изменение уже перенесено.'))));
-      $('transfer-files').append(group);
-    }
-    $('apply-task-transfer').disabled = result.conflict || !result.files.some(file => file.changed);
-  } catch (error) { setText('transfer-note', errorText(error)); }
+  return showTransferV09();
 }
 $('transfer-task').addEventListener('click', showTransfer);
 $('apply-task-transfer').addEventListener('click', async () => {
-  const target = transferTarget; $('apply-task-transfer').disabled = true;
-  try { const files = await api.transferTask(target.chatId, target.token); setText('transfer-note', 'Перенесено файлов: ' + files.length + '. Исходный индекс Git сохранён.'); }
-  catch (error) { setText('transfer-note', errorText(error) + ' Закройте и откройте перенос заново.'); }
+  return applyTransferV09();
 });
 
 api.state().then(updateState).catch(toast);
