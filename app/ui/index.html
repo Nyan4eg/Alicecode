@@ -62,6 +62,10 @@
             <span>Чат в архиве</span><button id="restore-active-chat" class="quiet" type="button">Восстановить</button>
           </section>
           <form id="composer" class="composer">
+            <div class="composer-mode-row">
+              <select id="chat-mode" aria-label="Режим работы Алисы"><option value="code">Изменить код</option><option value="discuss">Обсудить</option></select>
+              <span id="mode-note">Правки и команды — с разрешения</span>
+            </div>
             <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" aria-describedby="compose-hint" placeholder="Что нужно сделать в проекте?"></textarea>
             <div id="attachments" class="attachments" aria-label="Прикреплённые фрагменты" hidden></div>
             <div class="composer-footer">
@@ -96,6 +100,7 @@
           <strong>Рабочая папка</strong>
           <div class="explorer-actions">
             <button id="find-file" class="quiet" type="button" title="Найти файл · Ctrl+P" aria-keyshortcuts="Control+p" disabled>Найти</button>
+            <button id="find-content" class="quiet" type="button" title="Поиск по содержимому · Ctrl+Shift+F" aria-label="Поиск по содержимому" disabled>⌕</button>
             <button id="reveal" class="quiet icon" type="button" title="Открыть в Проводнике" aria-label="Открыть в Проводнике" disabled>↗</button>
           </div>
         </div>
@@ -116,6 +121,12 @@
             <button id="edit-preview" class="quiet context-button" type="button" hidden>Редактировать</button>
             <button id="attach-preview" class="quiet context-button" type="button" title="Добавить файл или строки в контекст" hidden>@</button>
             <button id="close-preview" class="quiet icon" type="button" aria-label="Закрыть просмотр" title="Закрыть просмотр">×</button>
+          </div>
+          <div id="preview-nav" class="preview-nav" hidden>
+            <button id="previous-change" class="quiet" type="button" title="Предыдущее изменение">↑</button>
+            <span id="change-position"></span>
+            <button id="next-change" class="quiet" type="button" title="Следующее изменение">↓</button>
+            <button id="edit-change" class="quiet" type="button">К строке в редакторе</button>
           </div>
           <div id="preview-git" class="git-actions" hidden>
             <button id="stage-file" class="quiet" type="button"></button>
@@ -226,6 +237,13 @@
       <p id="commit-error" class="error" role="alert" hidden></p>
       <div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="confirm-commit" class="primary" type="submit">Создать коммит</button></div>
     </form>
+  </dialog>
+
+  <dialog id="content-dialog" class="history-dialog content-dialog" aria-labelledby="content-title">
+    <div class="dialog-header"><h2 id="content-title">Поиск в проекте</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
+    <input id="content-query" type="search" aria-label="Текст для поиска" placeholder="Фраза или часть кода · Enter — найти" maxlength="240" autocomplete="off">
+    <p id="content-status" class="muted" role="status">Поиск по текстовым файлам с учётом исключений Git.</p>
+    <div id="content-results" class="content-results"></div>
   </dialog>
 
   <dialog id="file-dialog" class="history-dialog" aria-labelledby="file-dialog-title">

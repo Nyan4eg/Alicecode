@@ -46,6 +46,12 @@ let stageTarget;
 let commitTarget;
 let attachmentSelection;
 let attachmentBusy = false;
+const chatViews = new Map();
+let workspaceTimer;
+let restoringWorkspace = false;
+let restoreGeneration = 0;
+let contentTimer;
+let contentRequest = 0;
 const providerLabels = { key: 'AI Studio по API-ключу', subscription: 'Yandex Cloud по подписке' };
 
 function element(tag, className, text) {
@@ -165,27 +171,13 @@ function fileLink(path, label = path, options = {}) {
 }
 
 function formatMessage(text, paths = []) {
-  const container = element('div', 'message-text');
-  const parts = text.split(/(?:^|\n)```[^\n]*\n|\n```(?=\n|$)/);
-  for (const [i, part] of parts.entries()) {
-    if (i % 2) {
-      container.append(element('pre', '', part));
-      continue;
-    }
-    let end = 0;
-    const tokens = /\[([^\]\n]+)\]\(([^\n)]+)\)|`([^`\n]+)`|(?<![\p{L}\p{N}_.])([\p{L}\p{N}_./\\-]+\.[\p{L}\p{N}_-]{1,15}(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)?)(?=[\s,.:;!?()[\]]|$)/gu;
-    for (const match of part.matchAll(tokens)) {
-      const [, label, target, code, bare] = match;
-      container.append(document.createTextNode(part.slice(end, match.index)));
-      const reference = findReference(target ?? code ?? bare, paths) ?? (label && findReference(label, paths));
-      if (reference) container.append(fileLink(reference.path, label ?? code ?? bare, reference));
-      else if (code) container.append(element('code', '', code));
-      else container.append(document.createTextNode(label ?? bare));
-      end = match.index + match[0].length;
-    }
-    container.append(document.createTextNode(part.slice(end)));
-  }
-  return container;
+  return window.aliceMarkdown.render(text, {
+    fileReference: (value, label) => {
+      const ref = findReference(value, paths) ?? (label && findReference(label, paths));
+      return ref ? fileLink(ref.path, label ?? value, ref) : null;
+    },
+    copyText: api.copyText, openExternal: url => api.openExternal(url).catch(toast),
+  });
 }
 
 function actionOutcome(tool) {
@@ -232,6 +224,13 @@ function workSummary(message, paths) {
       if (Number.isFinite(tool.elapsedMs)) row.append(element('span', 'test-duration',
         `${(tool.elapsedMs / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} с`));
       row.append(element('span', `outcome ${tone}`, label));
+      if (tool.repeatable && message.status !== 'running') {
+        const repeat = element('button', 'quiet', 'Повторить');
+        repeat.type = 'button';
+        repeat.disabled = Boolean(state.busy || state.workspaceMutation || activeChat()?.archivedAt);
+        repeat.addEventListener('click', () => confirmReplay(message, tool));
+        row.append(repeat);
+      }
       runs.append(row);
     }
     panel.append(runs);
@@ -268,6 +267,10 @@ function workSummary(message, paths) {
   }
   if (!tools.length) return panel;
   const journal = disclosure(`${message.id}:journal`, `Журнал действий · ${tools.length}`);
+  if (tools.some(tool => tool.status === 'failed' || tool.exitCode > 0)) {
+    journal.classList.add('journal-errors');
+    journal.querySelector('summary').append(element('span', 'outcome failed', 'Есть ошибки'));
+  }
   const list = element('div', 'tool-list');
   for (const tool of tools) {
     const details = disclosure(`${message.id}:${tool.id}`, executedCommand(tool) ?? tool.title);
@@ -334,6 +337,7 @@ function renderMessage(message) {
   role.append(document.createTextNode(local ? 'Локальный запуск тестов' : 'Алиса'));
   if (message.modelId) role.append(element('span', 'model-label',
     state.models.find(model => model.id === message.modelId)?.label ?? message.modelId));
+  if (message.mode === 'discuss') role.append(element('span', 'mode-badge', 'Обсуждение · только чтение'));
   row.append(role);
   const paths = [...new Set(message.tools.filter(tool => tool.status === 'completed' && tool.decision !== 'denied')
     .flatMap(tool => tool.paths ?? []))];
@@ -372,6 +376,9 @@ function renderThread(forceScroll) {
 
 function renderComposer() {
   const chat = activeChat();
+  $('chat-mode').value = chat?.mode ?? 'code';
+  $('chat-mode').disabled = !chat || Boolean(chat.archivedAt) || state.busy === chat.id;
+  setText('mode-note', chat?.mode === 'discuss' ? 'Только чтение и поиск · без команд' : 'Правки и команды — с разрешения');
   $('composer-area').hidden = !chat;
   $('archive-banner').hidden = !chat?.archivedAt;
   $('composer').hidden = Boolean(chat?.archivedAt);
@@ -404,6 +411,7 @@ function renderComposer() {
   $('send').disabled = !chat || chat.archivedAt || !state.configured || !available || Boolean(state.busy || state.workspaceMutation)
     || sending || !$('prompt').value.trim();
   renderAttachments();
+  scheduleWorkspaceSave();
 }
 
 function renderModels() {
@@ -497,6 +505,18 @@ function renderUpdates() {
 function updateState(next) {
   const previous = state;
   const changed = previous?.activeChat !== next.activeChat;
+  if (changed && previous?.activeChat && next.chats.some(item => item.id === previous.activeChat)) persistWorkspace();
+  if (!previous) {
+    for (const [id, saved] of Object.entries(next.chatStates ?? {})) {
+      drafts.set(id, saved.draft ?? '');
+      draftContexts.set(id, saved.context ?? []);
+      chatViews.set(id, saved.view ?? {});
+    }
+    for (const [id, files] of Object.entries(next.draftFiles ?? {})) externalDrafts.set(id, files);
+    for (const [id, saved] of Object.entries(next.projectStates ?? {})) {
+      editorFiles.set(id, new Map((saved.files ?? []).map(file => [file.path, file])));
+    }
+  }
   if (changed && previous?.activeChat) drafts.set(previous.activeChat, $('prompt').value);
   state = next;
   if (!layout) {
@@ -504,6 +524,7 @@ function updateState(next) {
     showInspector(layout.inspectorVisible, false);
   }
   if (changed) {
+    restoringWorkspace = true;
     $('prompt').value = drafts.get(state.activeChat) ?? '';
     workspace = undefined;
     folders.clear();
@@ -511,8 +532,8 @@ function updateState(next) {
     if (priorProject !== activeChat()?.projectId) {
       expandedFolders.clear();
       folderLimits.clear();
-      hideEditor();
     }
+    hideEditor();
     review = undefined;
     if (tab === 'review') selectTab('files');
     else selectTab(tab);
@@ -528,6 +549,7 @@ function updateState(next) {
   $('new-chat').hidden = !chat;
   $('reveal').disabled = !chat;
   $('find-file').disabled = !chat;
+  $('find-content').disabled = !chat;
   renderModels();
   renderNavigation();
   renderComposer();
@@ -536,6 +558,7 @@ function updateState(next) {
   renderEditorTabs();
   if (changed || previous?.busy && !state.busy || previous?.workspaceMutation && !state.workspaceMutation) refreshWorkspace();
   else if (!previous) renderWorkspace();
+  if (changed) void restoreWorkspace(chatViews.get(state.activeChat) ?? {});
 }
 
 async function select(chatId) {
@@ -637,6 +660,7 @@ function selectTab(next) {
   $('review-tab').hidden = !review;
   for (const name of ['files', 'changes', 'review']) $(`${name}-tab`).setAttribute('aria-selected', String(tab === name));
   renderEditorTabs();
+  scheduleWorkspaceSave();
 }
 
 function showInspector(visible, persist = true) {
@@ -724,6 +748,7 @@ function renderPreview() {
   $('inline-preview').hidden = !preview;
   $('inspector').classList.toggle('reviewing', Boolean(preview || editView));
   renderLayout();
+  $('preview-nav').hidden = !preview || preview.mode === 'files' || Boolean(preview.loading || preview.error);
   if (!preview) return;
   setText('preview-title', preview.path).title = preview.path;
   const mode = preview.mode === 'review' ? 'Изменения за запуск' : preview.mode === 'files' ? 'Файл'
@@ -755,12 +780,15 @@ function renderPreview() {
   const first = target > 3000 ? Math.min(Math.max(0, target - 100), Math.max(0, lines.length - 3000)) : 0;
   let number = preview.mode === 'files' ? first + 1 : null;
   let highlighted;
+  let hunkIndex = -1;
+  const hunks = [];
   for (const line of lines.slice(first, first + 3000)) {
     let tone = '';
     let label = '';
     if (preview.mode !== 'files') {
       const hunk = /^@@ .+ \+(\d+)(?:,\d+)? @@/.exec(line);
       if (hunk) {
+        hunkIndex++;
         number = Number(hunk[1]);
         tone = 'diff-info';
       } else if (number === null) {
@@ -779,6 +807,12 @@ function renderPreview() {
     gutter.setAttribute('aria-hidden', 'true');
     row.append(gutter, element('span', '', line), document.createTextNode('\n'));
     body.append(row);
+    if (tone === 'diff-info' && line.startsWith('@@')) {
+      row.classList.add('diff-hunk');
+      row.dataset.line = Math.max(1, number);
+      hunks.push(row);
+      if (hunkIndex === (preview.hunkIndex ?? 0)) { highlighted = row; row.classList.add('line-target'); }
+    }
     if (target && Number(label) === target) {
       highlighted = row;
       row.classList.add('line-target');
@@ -788,16 +822,24 @@ function renderPreview() {
     'Строки ' + (first + 1) + '–' + Math.min(first + 3000, lines.length) + ' из ' + lines.length));
   if (highlighted) body.scrollTop = Math.max(0, highlighted.offsetTop - body.firstChild.offsetTop - body.clientHeight / 3);
   else if (target > lines.length) body.append(element('span', 'code-line diff-info', 'Строки ' + target + ' в файле нет.'));
+  if (preview.mode !== 'files') {
+    preview.hunkIndex = Math.max(0, Math.min(preview.hunkIndex ?? 0, hunks.length - 1));
+    const count = hunks.length;
+    setText('change-position', count ? `${preview.hunkIndex + 1} / ${count}` : 'Нет фрагментов');
+    $('previous-change').disabled = !count;
+    $('next-change').disabled = !count;
+    $('edit-change').disabled = !count;
+  }
 }
 
-async function openPreview(path, mode, { line = null, scope = 'all', messageId = review?.messageId } = {}) {
+async function openPreview(path, mode, { line = null, scope = 'all', messageId = review?.messageId, hunkIndex = 0 } = {}) {
   if (!state.activeChat) return;
   const chatId = state.activeChat;
   hideEditor();
   const id = ++previewRequest;
   if (!layout.inspectorVisible) showInspector(true);
   selectTab(mode);
-  preview = { path, mode, line, scope, messageId, loading: true };
+  preview = { path, mode, line, scope, messageId, hunkIndex, loading: true };
   renderPreview();
   renderWorkspace();
   const body = $('preview-content');
@@ -810,7 +852,7 @@ async function openPreview(path, mode, { line = null, scope = 'all', messageId =
       const note = file.limited ? 'Фрагмент превышает лимит сохранённого сравнения.'
         : file.binary ? 'Содержимое двоичного файла изменилось.'
           : file.status === 'A' ? 'Добавлен пустой файл.' : 'Удалён пустой файл.';
-      preview = { path, mode, line, scope, messageId, text: file.patch, note };
+      preview = { path, mode, line, scope, messageId, hunkIndex, text: file.patch, note };
     } else {
       let text;
       if (mode === 'changes') text = await api.readDiff(chatId, path, scope);
@@ -825,7 +867,7 @@ async function openPreview(path, mode, { line = null, scope = 'all', messageId =
         }
       }
       if (id !== previewRequest) return;
-      preview = { path, mode, line, scope, text };
+      preview = { path, mode, line, scope, hunkIndex, text };
     }
   } catch (error) {
     if (id !== previewRequest) return;
@@ -833,7 +875,27 @@ async function openPreview(path, mode, { line = null, scope = 'all', messageId =
   }
   renderPreview();
   renderWorkspace();
+  scheduleWorkspaceSave();
 }
+
+async function navigateChange(direction) {
+  if (!preview || preview.loading) return;
+  const count = $('preview-content').querySelectorAll('.diff-hunk').length;
+  const next = (preview.hunkIndex ?? 0) + direction;
+  if (next >= 0 && next < count) { preview.hunkIndex = next; renderPreview(); scheduleWorkspaceSave(); return; }
+  const paths = preview.mode === 'review' ? review?.files.map(file => file.path) : workspace?.changes.map(file => file.path);
+  if (!paths?.length) return;
+  const path = paths[(paths.indexOf(preview.path) + direction + paths.length) % paths.length];
+  await openPreview(path, preview.mode, { ...preview, hunkIndex: direction < 0 ? 2999 : 0 });
+  renderPreview();
+}
+$('previous-change').addEventListener('click', () => navigateChange(-1));
+$('next-change').addEventListener('click', () => navigateChange(1));
+$('edit-change').addEventListener('click', () => {
+  const rows = $('preview-content').querySelectorAll('.diff-hunk');
+  const line = Number(rows[preview?.hunkIndex ?? 0]?.dataset.line ?? 1);
+  if (preview) void openEditor(preview.path, line);
+});
 
 function openReview(message, path) {
   if (!message.review?.files.length || message.chatId !== state.activeChat) return;
@@ -846,6 +908,7 @@ function closePreview() {
   preview = undefined;
   renderPreview();
   renderWorkspace();
+  scheduleWorkspaceSave();
 }
 
 function workspaceFile(item, mode, scope = 'all') {
@@ -1438,6 +1501,9 @@ document.addEventListener('keydown', event => {
   } else if (!modal && event.ctrlKey && event.shiftKey && event.code === 'KeyE') {
     event.preventDefault();
     showInspector($('inspector').hidden);
+  } else if (!modal && event.ctrlKey && event.shiftKey && event.code === 'KeyF') {
+    event.preventDefault();
+    openContentSearch();
   }
 });
 $('close-preview').addEventListener('click', closePreview);
@@ -1497,6 +1563,7 @@ function renderEditorTabs() {
 function hideEditor() {
   editorRequest++;
   if (!editView) return;
+  if (editor) Object.assign(editView, editor.position());
   editor?.destroy();
   editor = undefined;
   editView = undefined;
@@ -1515,7 +1582,8 @@ function showEditor(file, line, focus = true) {
     file.text = text;
     file.dirty = text !== file.cleanText;
     if (changed) renderEditorTabs();
-  }, saveCurrentFile);
+    scheduleWorkspaceSave();
+  }, saveCurrentFile, scheduleWorkspaceSave);
   $('inline-editor').hidden = false;
   setText('editor-title', file.path).title = file.path;
   selectTab('files');
@@ -1523,12 +1591,13 @@ function showEditor(file, line, focus = true) {
   renderWorkspace();
   if (line) editor.line(line);
   if (focus) editor.focus();
+  scheduleWorkspaceSave();
 }
 
-async function openEditor(path, line) {
+async function openEditor(path, line, focus = true) {
   if (editView?.path === path) {
     if (line) editor.line(line);
-    editor.focus();
+    if (focus) editor.focus();
     return;
   }
   if (!window.aliceEditor) return toast('Редактор не загрузился. Перезапустите Alicecode.');
@@ -1540,10 +1609,10 @@ async function openEditor(path, line) {
     if (!file?.dirty) {
       const next = await api.readEditor(state.activeChat, path);
       if (request !== editorRequest || files !== editorGroup()) return;
-      file = { ...next, cleanText: next.text, dirty: false };
+      file = { ...next, cleanText: next.text, dirty: false, selection: file?.selection, scrollTop: file?.scrollTop };
       files.set(file.path, file);
     }
-    showEditor(file, line);
+    showEditor(file, line, focus);
   } catch (error) { toast(error); }
 }
 
@@ -1557,6 +1626,7 @@ function closeEditorTab(files, file) {
     else void openPreview(file.path, 'files');
   }
   renderEditorTabs();
+  scheduleWorkspaceSave();
 }
 
 async function saveCurrentFile() {
@@ -1667,7 +1737,9 @@ $('reload-editor').addEventListener('click', () => {
   if (editView === file) showEditor(file);
 });
 window.addEventListener('beforeunload', event => {
-  if ([...editorFiles.values()].some(files => [...files.values()].some(file => file.dirty))) {
+  const result = api.flushWorkspace(workspaceValues());
+  if (result.error) {
+    toast(result.error);
     event.preventDefault();
     event.returnValue = false;
   }
@@ -1935,6 +2007,103 @@ $('check-provider').addEventListener('click', async () => {
     setText('provider-test-status', 'Модель ответила. Подключение работает.');
   } catch (error) { setText('provider-test-status', errorText(error)); }
   finally { button.disabled = !state.configured || $('provider-mode').value !== state.providerMode; }
+});
+
+function workspaceValues() {
+  if (!state?.activeChat || restoringWorkspace) return [];
+  const chat = activeChat();
+  if (!chat) return [];
+  if (editView && editor) Object.assign(editView, editor.position());
+  const value = { draft: $('prompt').value, context: currentContext(), view: {
+    tab, scrollTop: $('thread').scrollTop, atBottom: atBottom(), reviewMessageId: review?.messageId,
+    editorPath: editView?.path,
+    preview: preview ? { path: preview.path, mode: preview.mode, line: preview.line, scope: preview.scope,
+      messageId: preview.messageId, hunkIndex: preview.hunkIndex } : null,
+  } };
+  drafts.set(chat.id, value.draft);
+  chatViews.set(chat.id, value.view);
+  return [['chat', chat.id, value], ['project', chat.projectId, { files: [...(editorGroup()?.values() ?? [])] }]];
+}
+
+function persistWorkspace() {
+  clearTimeout(workspaceTimer);
+  for (const [scope, id, value] of workspaceValues()) void api.saveWorkspace(scope, id, value).catch(toast);
+}
+
+function scheduleWorkspaceSave() {
+  if (!state || restoringWorkspace) return;
+  clearTimeout(workspaceTimer);
+  workspaceTimer = setTimeout(persistWorkspace, 180);
+}
+
+async function restoreWorkspace(view) {
+  const generation = ++restoreGeneration;
+  restoringWorkspace = true;
+  try {
+    const message = state.messages.find(item => item.id === view.reviewMessageId);
+    if (message?.review?.files.length) review = { ...message.review, messageId: message.id };
+    selectTab(view.tab === 'review' && review ? 'review' : view.tab === 'changes' ? 'changes' : 'files');
+    if (view.preview?.path && (view.preview.mode !== 'review' || review)) await openPreview(view.preview.path, view.preview.mode, view.preview);
+    else if (view.editorPath) await openEditor(view.editorPath, null, false);
+    renderWorkspace();
+    if (generation !== restoreGeneration) return;
+    if (view.atBottom !== false) scrollBottom();
+    else $('thread').scrollTop = Math.max(0, view.scrollTop ?? 0);
+  } finally {
+    if (generation === restoreGeneration) restoringWorkspace = false;
+  }
+}
+
+$('thread').addEventListener('scroll', scheduleWorkspaceSave);
+$('chat-mode').addEventListener('change', async () => {
+  try { updateState(await api.selectMode(state.activeChat, $('chat-mode').value)); }
+  catch (error) { toast(error); renderComposer(); }
+});
+
+function openContentSearch() {
+  if (!activeChat() || document.querySelector('dialog[open]')) return;
+  $('content-dialog').showModal();
+  $('content-query').focus();
+  $('content-query').select();
+}
+
+async function runContentSearch() {
+  const request = ++contentRequest;
+  const chatId = state.activeChat;
+  const query = $('content-query').value.trim();
+  $('content-results').replaceChildren();
+  if (!query) { setText('content-status', 'Введите текст для поиска.'); return; }
+  setText('content-status', 'Ищем…');
+  try {
+    const result = await api.searchContent(chatId, query);
+    if (request !== contentRequest || chatId !== state.activeChat || !$('content-dialog').open) return;
+    setText('content-status', `${result.matches.length} совпадений · проверено файлов: ${result.scanned}`
+      + (result.skipped ? ` · пропущено: ${result.skipped}` : '')
+      + (result.limited ? ' · достигнут лимит, уточните запрос' : ''));
+    for (const match of result.matches) {
+      const row = element('div', 'content-result');
+      const open = element('button', 'content-hit'); open.type = 'button';
+      open.append(element('strong', '', match.path + ':' + match.line), element('code', '', match.snippet));
+      open.addEventListener('click', () => { $('content-dialog').close(); showInspector(true); void openEditor(match.path, match.line); });
+      const attach = element('button', 'quiet content-attach', '@ В чат'); attach.type = 'button';
+      attach.disabled = currentContext().length >= 6 || Boolean(activeChat()?.archivedAt);
+      attach.addEventListener('click', async () => {
+        try {
+          const fragment = await api.previewContext(chatId, match.path, Math.max(1, match.line - 2), Math.min(match.totalLines, match.line + 2));
+          if (state.activeChat !== chatId || currentContext().length >= 6) return;
+          const { content, ...ref } = fragment;
+          if (!currentContext().some(item => item.digest === ref.digest)) draftContexts.set(chatId, [...currentContext(), ref]);
+          $('content-dialog').close(); renderComposer(); $('prompt').focus();
+        } catch (error) { toast(error); }
+      });
+      row.append(open, attach); $('content-results').append(row);
+    }
+  } catch (error) { if (request === contentRequest) setText('content-status', errorText(error)); }
+}
+$('find-content').addEventListener('click', openContentSearch);
+$('content-query').addEventListener('input', () => { clearTimeout(contentTimer); contentRequest++; contentTimer = setTimeout(runContentSearch, 280); });
+$('content-query').addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); clearTimeout(contentTimer); void runContentSearch(); }
 });
 
 api.state().then(updateState).catch(toast);

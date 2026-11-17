@@ -122,6 +122,31 @@ export async function searchFiles(root, query) {
   return files;
 }
 
+// Literal text search, with the same Git visibility and resolved-path checks as the explorer.
+export async function searchContent(root, query, { signal } = {}) {
+  const needle = typeof query === 'string' ? query.trim().slice(0, 240).toLocaleLowerCase('ru') : '';
+  if (!needle) return { matches: [], scanned: 0, skipped: 0, limited: false };
+  const matches = [];
+  let scanned = 0, skipped = 0, bytes = 0, limited = false;
+  for await (const path of await gitFiles(root) ?? walkFiles(root)) {
+    signal?.throwIfAborted();
+    if (scanned >= 4000 || bytes >= 24_000_000 || matches.length >= 150) { limited = true; break; }
+    scanned++;
+    let text;
+    try { text = await readProjectFile(root, path); } catch { skipped++; continue; }
+    bytes += Buffer.byteLength(text);
+    const lines = text.replace(/\r?\n$/, '').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const column = lines[i].toLocaleLowerCase('ru').indexOf(needle);
+      if (column < 0) continue;
+      const start = Math.max(0, column - 70);
+      matches.push({ path, line: i + 1, column: column + 1, totalLines: lines.length, snippet: (start ? '…' : '') + lines[i].slice(start, start + 240) });
+      if (matches.length >= 150) { limited = true; break; }
+    }
+  }
+  return { matches, scanned, skipped, limited };
+}
+
 async function trackedDiff(root, flags, path) {
   const head = await gitIn(root, ['rev-parse', '--verify', 'HEAD']).then(() => true, () => false);
   const args = ['diff', '--relative', '--no-renames', '--no-ext-diff', '--no-textconv', ...flags];

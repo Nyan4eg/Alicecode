@@ -5,6 +5,11 @@ const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(da
 
 contextBridge.exposeInMainWorld('alicecode', {
   state: invoke('app:state'),
+  saveWorkspace: invoke('workspace:save'),
+  flushWorkspace: values => ipcRenderer.sendSync('workspace:flush', values),
+  selectMode: invoke('chat:mode'),
+  copyText: invoke('app:copy'),
+  openExternal: invoke('app:open-external'),
   createProject: invoke('project:create'),
   chooseFolder: invoke('project:choose'),
   openProject: invoke('project:open'),
@@ -12,6 +17,7 @@ contextBridge.exposeInMainWorld('alicecode', {
   inspectProject: invoke('project:inspect'),
   listDirectory: invoke('project:directory'),
   searchFiles: invoke('project:search-files'),
+  searchContent: invoke('project:search-content'),
   readFile: invoke('project:read'),
   readEditor: invoke('project:editor'),
   saveFile: invoke('project:save-file'),

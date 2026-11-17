@@ -1,4 +1,5 @@
 import { EditorState } from '@codemirror/state';
+import './markdown.mjs';
 import { EditorView, drawSelection, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { gotoLine, openSearchPanel, searchKeymap } from '@codemirror/search';
@@ -18,14 +19,17 @@ function language(path) {
 }
 
 window.aliceEditor = {
-  create(parent, file, onChange, onSave) {
+  create(parent, file, onChange, onSave, onViewChange = () => {}) {
     const view = new EditorView({
       parent,
       state: EditorState.create({ doc: file.text, extensions: [
         EditorView.cspNonce.of('alicecode-editor'), lineNumbers(), history(), drawSelection(),
         highlightActiveLine(), indentOnInput(), bracketMatching(), syntaxHighlighting(defaultHighlightStyle),
         EditorView.contentAttributes.of({ 'aria-label': 'Редактор кода', spellcheck: 'false' }),
-        EditorView.updateListener.of(update => { if (update.docChanged) onChange(update.state.sliceDoc()); }),
+        EditorView.updateListener.of(update => {
+          if (update.docChanged) onChange(update.state.sliceDoc());
+          if (update.selectionSet) onViewChange();
+        }),
         EditorState.phrases.of({ Find: 'Найти', Replace: 'Заменить', next: 'Далее', previous: 'Назад',
           all: 'Все', 'match case': 'Регистр', regexp: 'Регулярное выражение', 'by word': 'Слово целиком',
           'replace': 'Заменить', 'replace all': 'Заменить все', 'close': 'Закрыть',
@@ -35,7 +39,12 @@ window.aliceEditor = {
         language(file.path),
       ] }),
     });
+    if (file.selection) view.dispatch({ selection: { anchor: Math.min(file.selection.anchor ?? 0, view.state.doc.length),
+      head: Math.min(file.selection.head ?? 0, view.state.doc.length) } });
+    view.scrollDOM.scrollTop = file.scrollTop ?? 0;
+    view.scrollDOM.addEventListener('scroll', onViewChange);
     return {
+      position: () => ({ selection: { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head }, scrollTop: view.scrollDOM.scrollTop }),
       focus: () => view.focus(),
       destroy: () => view.destroy(),
       search: () => openSearchPanel(view),

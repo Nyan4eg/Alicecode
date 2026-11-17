@@ -35,6 +35,7 @@ async function readText(path, root) {
 export class Attachments {
   picker = null;
   drafts = new Map();
+  persistDraft = () => {};
 
   constructor(home, originalHome) {
     this.home = home;
@@ -128,6 +129,7 @@ export class Attachments {
     if (!this.drafts.has(chatId) && this.drafts.size >= 16) throw new Error('Отправьте или уберите вложения в других черновиках.');
     for (const item of items) existing.set(item.id, item);
     this.drafts.set(chatId, existing);
+    this.persistDraft(chatId, [...existing.values()]);
     this.picker = null;
     return items.map(({ text, ...item }) => item);
   }
@@ -137,6 +139,7 @@ export class Attachments {
     if (!draft) return;
     for (const id of ids) draft.delete(id);
     if (!draft.size) this.drafts.delete(chatId);
+    this.persistDraft(chatId, [...draft.values()]);
   }
 
   files(chatId, ids) {

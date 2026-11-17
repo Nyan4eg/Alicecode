@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, safeStorage, shell } from 'electron';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -7,7 +7,8 @@ import { Store } from './store.mjs';
 import { AcpClient, startRuntime } from './acp.mjs';
 import { alias } from './adapter.mjs';
 import { readPrototypeCredentials, validateCredentials } from './credentials.mjs';
-import { createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles } from './workspace.mjs';
+import { createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles, searchContent } from './workspace.mjs';
+import { discuss } from './discussion.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
@@ -46,6 +47,8 @@ function snapshot() {
   }]));
   return {
     ...store.snapshot(), configured: Boolean(credentials), credentialError,
+    chatStates: store.workspaceStates('chat'), projectStates: store.workspaceStates('project'),
+    draftFiles: Object.fromEntries([...attachments.drafts].map(([id, files]) => [id, [...files.values()].map(({ text, ...file }) => file)])),
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
     workspaceMutation,
     updates: updates.snapshot(),
@@ -188,6 +191,7 @@ function enqueuePermission(turn, details, choose) {
 }
 
 async function requestPermission(turn, params) {
+  if (turn.mode === 'discuss') return cancelledPermission();
   const permit = params.options.find(option => option.kind === 'allow_once');
   if (!permit) return cancelledPermission();
   const reject = params.options.find(option => option.kind === 'reject_once');
@@ -247,6 +251,7 @@ async function fileRequest(turn, method, params) {
     return { content: text.split(/\r?\n/).slice(first, first + (params.limit ?? Infinity)).join('\n') };
   }
   if (!turn.sessionId) throw new Error('Сессия ещё не открыта.');
+  if (turn.mode === 'discuss') throw new Error('В режиме обсуждения запись заблокирована.');
   if (attachments.isSnapshot(params.path, turn.cwd)) throw new Error('Вложения доступны только для чтения.');
   validateText(params.content);
   const file = await editableFile(turn.cwd, params.path, true);
@@ -337,11 +342,13 @@ async function send(chatId, input, refs = [], externalIds = []) {
   }
   const message = {
     id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
-      ...external.map(({ text, ...item }) => item)]),
-    chatId, modelId: model.id,
+      ...external.map(({ text, ...item }) => item)], chat.mode),
+    chatId, modelId: model.id, mode: chat.mode,
     role: 'assistant', text: '', tools: [], status: 'running',
   };
-  const turn = { chatId, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
+  const savedWorkspace = store.workspaceStates('chat')[chatId];
+  if (savedWorkspace) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
+  const turn = { chatId, mode: chat.mode, cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
     approvedEdits: new Map(), fileReads: new Map(), attachments: store.externalAttachments(chatId) };
   active = turn;
   emit('app:state', snapshot());
@@ -353,6 +360,23 @@ async function send(chatId, input, refs = [], externalIds = []) {
     if (turn.stop) return;
     turn.stage = 'agent';
     emit('app:state', snapshot());
+    const referenceCatalog = turn.attachments.length ? 'Справочные вложения этого чата (только чтение, доступны встроенным инструментом чтения):\n'
+      + [...new Map(turn.attachments.map(file => [file.id, file])).values()].slice(-32)
+        .map(file => JSON.stringify(file.label) + ': ' + JSON.stringify(attachments.path(chatId, file).replaceAll('\\', '/'))).join('\n') : '';
+    if (chat.mode === 'discuss') {
+      turn.abort = new AbortController();
+      const history = store.db.prepare("SELECT role,text FROM messages WHERE chatId=? AND id<? AND text<>'' ORDER BY id DESC LIMIT 24")
+        .all(chatId, message.id - 1).reverse().map(item => ({ role: item.role, content: item.text.slice(-12000) }));
+      const provider = createProvider(credentials);
+      await discuss({ root: chat.cwd, provider, model: provider.model(credentials.folderId, model.id), folderId: credentials.folderId,
+        history, prompt: [text, referenceCatalog, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)].join('\n\n'),
+        signal: turn.abort.signal,
+        readAttachment: path => attachments.read(chatId, turn.attachments, path),
+        onText: text => { message.text += (message.text ? '\n\n' : '') + text; publishTurn(turn); },
+        onTool: tool => { turn.tools.set(tool.id, { ...tool }); publishTurn(turn); },
+      });
+      return;
+    }
     if (runtime && runtime.modelId !== model.id) closeRuntime();
     runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model);
     if (turn.stop) return;
@@ -378,8 +402,9 @@ async function send(chatId, input, refs = [], externalIds = []) {
       store.setSession(chatId, turn.sessionId);
     }
     if (turn.stop) return;
+    const discussion = store.db.prepare("SELECT text FROM messages WHERE chatId=? AND mode='discuss' AND role='assistant' AND status='done' ORDER BY id DESC LIMIT 1").get(chatId)?.text;
     const result = await turn.client.request('session/prompt', {
-      sessionId: turn.sessionId, prompt: [text, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)]
+      sessionId: turn.sessionId, prompt: [text, referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)]
         .map(text => ({ type: 'text', text })),
     }, 240_000);
     if (result.stopReason === 'cancelled') turn.stop = true;
@@ -537,9 +562,24 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
     attachments = await Attachments.open(join(app.getPath('userData'), 'context-files'));
+    attachments.drafts = new Map(store.draftFiles().map(([id, files]) => [id, new Map(files.map(file => [file.id, file]))]));
+    attachments.persistDraft = (id, files) => store.saveDraftFiles(id, files);
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
+    bind('app:copy', value => { if (typeof value === 'string' && value.length <= 200000) clipboard.writeText(value); });
+    bind('app:open-external', url => {
+      if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new Error('Недопустимый адрес.');
+      return shell.openExternal(new URL(url).href);
+    });
+    bind('workspace:save', (scope, id, value) => store.saveWorkspace(scope, id, value));
+    ipcMain.on('workspace:flush', (event, values) => {
+      try {
+        if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame) throw new Error('Неподдерживаемый источник запроса.');
+        store.transaction(() => { for (const [scope, id, value] of values.slice(0, 2)) store.saveWorkspace(scope, id, value); });
+        event.returnValue = { ok: true };
+      } catch (error) { event.returnValue = { error: error.message }; }
+    });
     bind('project:create', async (name, parent) => {
       if (typeof name !== 'string') throw new Error('Введите имя проекта.');
       const base = parent || snapshot().projectRoot;
@@ -563,6 +603,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('project:inspect', async chatId => ({ changes: await listChanges(selectedPath(chatId)) }));
     bind('project:directory', (chatId, path) => listDirectory(selectedPath(chatId), path));
     bind('project:search-files', (chatId, query) => searchFiles(selectedPath(chatId), query));
+    bind('project:search-content', (chatId, query) => searchContent(selectedPath(chatId), query));
     bind('project:read', (chatId, path) => readProjectFile(selectedPath(chatId), path));
     bind('project:editor', editorFile);
     bind('project:save-file', (...args) => mutateWorkspace(() => saveEditor(...args)));
@@ -628,6 +669,12 @@ if (!app.requestSingleInstanceLock()) {
       if (store.chat(id).archivedAt) throw new Error('Восстановите чат из архива.');
       if (!available.some(model => model.id === modelId)) throw new Error('Модель недоступна в каталоге.');
       store.setModel(id, modelId);
+      return snapshot();
+    });
+    bind('chat:mode', (id, mode) => {
+      if (active?.chatId === id) throw new Error('Смените режим после завершения ответа.');
+      if (store.chat(id).archivedAt) throw new Error('Восстановите чат из архива.');
+      store.setMode(id, mode);
       return snapshot();
     });
     bind('history:search', (query, includeArchived) => store.search(query, includeArchived));

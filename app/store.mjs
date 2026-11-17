@@ -46,10 +46,12 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS managed_edits_message ON managed_edits(messageId, path);
       CREATE TABLE IF NOT EXISTS session_cleanup (sessionId TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS workspace_states (scope TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(scope,id));
+      CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
-    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER' });
-    this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'" });
+    this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'" });
+    this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'" });
     this.db.prepare('UPDATE chats SET modelId=? WHERE modelId IS NULL').run(legacyModel.id);
     this.db.function('search_fold', { deterministic: true }, fold);
   }
@@ -63,6 +65,36 @@ export class Store {
 
   setting(key) {
     return this.db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
+  }
+
+  saveWorkspace(scope, id, value) {
+    if (scope === 'chat') this.chat(id);
+    else if (scope !== 'project' || !this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(id)) throw new Error('Проект не найден.');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Некорректное состояние окна.');
+    const data = JSON.stringify(value);
+    if (data.length > (scope === 'chat' ? 150_000 : 8_000_000)) throw new Error('Слишком большой черновик. Сохраните часть файлов.');
+    this.db.prepare('INSERT INTO workspace_states VALUES (?,?,?) ON CONFLICT(scope,id) DO UPDATE SET data=excluded.data').run(scope, id, data);
+  }
+
+  workspaceStates(scope) {
+    return Object.fromEntries(this.db.prepare('SELECT id,data FROM workspace_states WHERE scope=?').all(scope)
+      .map(row => [row.id, JSON.parse(row.data)]));
+  }
+
+  saveDraftFiles(chatId, files) {
+    this.chat(chatId);
+    if (!files.length) this.db.prepare('DELETE FROM draft_files WHERE chatId=?').run(chatId);
+    else this.db.prepare('INSERT INTO draft_files VALUES (?,?) ON CONFLICT(chatId) DO UPDATE SET data=excluded.data').run(chatId, JSON.stringify(files));
+  }
+
+  draftFiles() {
+    return this.db.prepare('SELECT chatId,data FROM draft_files').all().map(row => [row.chatId, JSON.parse(row.data)]);
+  }
+
+  setMode(chatId, mode) {
+    this.chat(chatId);
+    if (!['code', 'discuss'].includes(mode)) throw new Error('Неизвестный режим.');
+    this.db.prepare('UPDATE chats SET mode=? WHERE id=?').run(mode, chatId);
   }
 
   set(key, value) {
@@ -173,6 +205,8 @@ export class Store {
       this.db.prepare('DELETE FROM managed_edits WHERE messageId IN (SELECT id FROM messages WHERE chatId=?)').run(id);
       this.db.prepare('DELETE FROM run_reviews WHERE messageId IN (SELECT id FROM messages WHERE chatId=?)').run(id);
       this.db.prepare('DELETE FROM messages WHERE chatId=?').run(id);
+      this.db.prepare('DELETE FROM draft_files WHERE chatId=?').run(id);
+      this.db.prepare("DELETE FROM workspace_states WHERE scope='chat' AND id=?").run(id);
       this.db.prepare('DELETE FROM chats WHERE id=?').run(id);
       this.leaveChat(chat);
       if (chat.sessionId && !this.db.prepare('SELECT 1 FROM chats WHERE sessionId=?').get(chat.sessionId)) {
@@ -221,7 +255,7 @@ export class Store {
     this.db.prepare('UPDATE chats SET sessionId=? WHERE id=?').run(sessionId, chatId);
   }
 
-  beginTurn(chatId, text, modelId = null, attachments = []) {
+  beginTurn(chatId, text, modelId = null, attachments = [], mode = 'code') {
     this.db.exec('BEGIN');
     try {
       this.db.prepare(`UPDATE chats SET updatedAt=?,
@@ -229,8 +263,8 @@ export class Store {
         THEN ? ELSE title END WHERE id=?`).run(Date.now(), text.replace(/\s+/g, ' ').slice(0, 60), chatId);
       this.db.prepare("INSERT INTO messages (chatId,role,text,status,attachments) VALUES (?,'user',?,'done',?)")
         .run(chatId, text, JSON.stringify(attachments));
-      const message = this.db.prepare("INSERT INTO messages (chatId,role,text,status,modelId) VALUES (?,'assistant','','running',?)")
-        .run(chatId, modelId);
+      const message = this.db.prepare("INSERT INTO messages (chatId,role,text,status,modelId,mode) VALUES (?,'assistant','','running',?,?)")
+        .run(chatId, modelId, mode);
       this.db.exec('COMMIT');
       return Number(message.lastInsertRowid);
     } catch (error) {
