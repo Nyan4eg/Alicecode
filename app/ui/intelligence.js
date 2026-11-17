@@ -162,12 +162,12 @@ function renderApiRequests() {
   const rows = (state.apiRequests ?? []).filter(item => item.chatId === state.activeChat);
   const list = $('api-list'); list.replaceChildren();
   for (const item of rows.slice(0, 60)) {
-    const row = element('details', 'api-request api-' + item.phase); row.open = openApiRows.has(item.id);
+    const row = element('details', 'api-request api-' + (item.finishReason === 'length' ? 'error' : item.phase)); row.open = openApiRows.has(item.id);
     row.dataset.apiId = item.id;
     row.addEventListener('toggle', () => { if (row.open) openApiRows.add(item.id); else openApiRows.delete(item.id); });
-    const title = `${apiPhaseLabels[item.phase] ?? item.phase} · попытка ${item.attempt ?? 1}/${item.maxAttempts ?? 3} · ${Math.round(item.elapsedMs / 1000)} с`;
+    const title = `${item.finishReason === 'length' ? 'Лимит ответа' : apiPhaseLabels[item.phase] ?? item.phase} · попытка ${item.attempt ?? 1}/${item.maxAttempts ?? 3} · ${Math.round(item.elapsedMs / 1000)} с`;
     row.append(element('summary', '', title));
-    row.append(element('p', '', item.reason ?? (item.kind === 'summary' ? 'Сжатие контекста' : 'Запрос модели')));
+    row.append(element('p', '', item.reason ?? (item.finishReason === 'length' ? 'Модель достигла лимита ответа.' : item.kind === 'summary' ? 'Сжатие контекста' : 'Запрос модели')));
     for (const event of item.events ?? []) if (event.phase === 'retry') row.append(element('p', 'retry-note', `Попытка ${event.attempt}: ${event.reason} · автоматический повтор запроса`));
     row.append(element('p', 'muted', item.usage ? `API: вход ${item.usage.input ?? '—'} · выход ${item.usage.output ?? '—'} · всего ${item.usage.total} токенов` : `Длина входа: ${item.inputChars.toLocaleString()} символов · примерно ${Math.ceil(item.inputChars / 4).toLocaleString()} токенов (оценка). Фактический расход API не передан.`));
     list.append(row);

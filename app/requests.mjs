@@ -37,17 +37,18 @@ export async function completeRequest(provider, path, options, observe = () => {
       } finally { await reader.cancel().catch(() => {}); }
       const bytes = Buffer.concat(parts), text = bytes.toString('utf8');
       const streaming = (upstream.headers.get('content-type') ?? '').includes('text/event-stream');
-      let usage = null;
+      let usage = null, finishReason = null;
       if (streaming) {
         let done = false;
         for (const line of text.split(/\r?\n/)) {
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim(); if (data === '[DONE]') { done = true; continue; } if (!data) continue;
           const chunk = JSON.parse(data); usage = usageCounts(chunk.usage) ?? usage;
+          finishReason = chunk.choices?.find(choice => choice.finish_reason)?.finish_reason ?? finishReason;
         }
         if (!done) throw new Error('Поток ответа оборвался до завершения.');
-      } else { usage = usageCounts(JSON.parse(text).usage); }
-      event({ phase: 'done', attempt, status: upstream.status, usage, outputChars: text.length });
+      } else { const parsed = JSON.parse(text); usage = usageCounts(parsed.usage); finishReason = parsed.choices?.[0]?.finish_reason ?? null; }
+      event({ phase: 'done', attempt, status: upstream.status, usage, finishReason, outputChars: text.length });
       // Nothing, including a partial tool call, reaches the agent before the response is complete.
       return { ...result, response: new Response(bytes, { status: upstream.status, headers: { 'content-type': upstream.headers.get('content-type') ?? 'application/json' } }) };
     } catch (error) {

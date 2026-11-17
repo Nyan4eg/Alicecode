@@ -57,3 +57,16 @@ test('a discussion exhausted output budget reports an error instead of claiming 
     provider: { request: async () => ({ response: Response.json({ choices: [{ finish_reason: 'length', message: { content: '' } }] }) }) },
   }), /исчерпала лимит/);
 });
+
+test('a truncated reasoning answer retries once with room for the answer and executes no partial tool calls', async () => {
+  const budgets = [], texts = [];
+  await discuss({ root: '.', model: 'model', folderId: 'folder', history: [], prompt: 'Continue summary',
+    signal: new AbortController().signal, onText: text => texts.push(text), onTool: () => assert.fail('Partial tool call executed'),
+    provider: { request: async (_path, options) => {
+      budgets.push(JSON.parse(options.body).max_tokens);
+      return { response: Response.json({ choices: [{ finish_reason: budgets.length === 1 ? 'length' : 'stop', message: budgets.length === 1
+        ? { content: 'partial', tool_calls: [{ id: 'partial', function: { name: 'read_file', arguments: '{"path":"incomplete' } }] }
+        : { content: 'CONTINUE marker from summary' } }] }) };
+    } } });
+  assert.deepEqual(budgets, [6000, 12000]); assert.deepEqual(texts, ['CONTINUE marker from summary']);
+});
