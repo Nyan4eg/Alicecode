@@ -35,3 +35,25 @@ test('discussion reads project files but rejects invented write, command and tra
     assert.equal(await readFile(path, 'utf8'), 'line1\nconst multiplier = 2;\n');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('an empty discussion answer retries once and never becomes a false successful result', async () => {
+  let calls = 0;
+  const text = [];
+  const options = { root: '.', model: 'model', folderId: 'folder', history: [], prompt: 'Explain',
+    signal: new AbortController().signal, onText: value => text.push(value), onTool: () => {},
+    provider: { request: async () => ({ response: Response.json({ choices: [{ finish_reason: 'stop',
+      message: { content: ++calls === 1 ? '' : 'Ответ' } }] }), redact: value => value }) } };
+  await discuss(options);
+  assert.equal(calls, 2); assert.deepEqual(text, ['Ответ']);
+  calls = 0;
+  options.provider.request = async () => { calls++; return { response: Response.json({ choices: [{ finish_reason: 'stop', message: { content: '' } }] }) }; };
+  await assert.rejects(discuss(options), /дважды вернула пустой ответ/);
+  assert.equal(calls, 2);
+});
+
+test('a discussion exhausted output budget reports an error instead of claiming completion', async () => {
+  await assert.rejects(discuss({ root: '.', model: 'model', history: [], prompt: 'Explain',
+    signal: new AbortController().signal, onText: () => {}, onTool: () => {},
+    provider: { request: async () => ({ response: Response.json({ choices: [{ finish_reason: 'length', message: { content: '' } }] }) }) },
+  }), /исчерпала лимит/);
+});
