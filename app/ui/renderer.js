@@ -394,6 +394,11 @@ function renderComposer() {
   }
   noticeNode.hidden = !notice && !other;
   $('prompt').disabled = !state.configured;
+  const prompt = $('prompt');
+  const priorHeight = prompt.style.height;
+  prompt.style.height = 'auto';
+  if (prompt.scrollHeight) prompt.style.height = prompt.scrollHeight + 'px';
+  else prompt.style.height = priorHeight;
   $('attach-file').disabled = !chat || !state.configured || currentContext().length >= 6;
   $('attach-external').disabled = $('attach-folder').disabled = !canAttach();
   $('send').disabled = !chat || chat.archivedAt || !state.configured || !available || Boolean(state.busy || state.workspaceMutation)

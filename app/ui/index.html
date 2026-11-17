@@ -62,17 +62,29 @@
             <span>Чат в архиве</span><button id="restore-active-chat" class="quiet" type="button">Восстановить</button>
           </section>
           <form id="composer" class="composer">
-            <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" placeholder="Опишите задачу для Алисы…"></textarea>
+            <textarea id="prompt" rows="2" aria-label="Сообщение Алисе" aria-describedby="compose-hint" placeholder="Что нужно сделать в проекте?"></textarea>
             <div id="attachments" class="attachments" aria-label="Прикреплённые фрагменты" hidden></div>
             <div class="composer-footer">
-              <button id="attach-file" class="quiet context-button" type="button" title="Добавить файл или строки в контекст">@ Файл</button>
-              <button id="attach-external" class="quiet context-button" type="button" title="Прикрепить файлы с диска или перетащить их в чат">Файлы</button>
-              <button id="attach-folder" class="quiet context-button" type="button" title="Выбрать файлы из папки">Папка</button>
-              <span id="compose-hint">Enter — отправить</span>
-              <button id="stop" class="quiet" type="button" hidden>■ Остановить</button>
-              <button id="send" class="primary" type="submit" disabled>Отправить <span aria-hidden="true">↑</span></button>
+              <div class="composer-tools" role="group" aria-label="Добавить контекст">
+                <button id="attach-file" class="composer-action" type="button" title="Файл или строки из проекта · @" aria-label="Добавить файл или строки из проекта">
+                  <span class="composer-icon at-symbol" aria-hidden="true">@</span><span class="composer-action-label">Контекст</span>
+                </button>
+                <button id="attach-external" class="composer-action" type="button" title="Прикрепить файлы с диска или перетащить их в чат" aria-label="Прикрепить файлы с диска">
+                  <span class="composer-icon clip-symbol" aria-hidden="true"></span><span class="composer-action-label">Файлы</span>
+                </button>
+                <button id="attach-folder" class="composer-action" type="button" title="Выбрать файлы из папки" aria-label="Выбрать файлы из папки">
+                  <span class="composer-icon folder-symbol" aria-hidden="true"></span><span class="composer-action-label">Папка</span>
+                </button>
+              </div>
+              <div class="composer-submit">
+                <button id="stop" class="quiet" type="button" hidden><span class="stop-symbol" aria-hidden="true"></span>Остановить</button>
+                <button id="send" class="primary" type="submit" title="Отправить сообщение · Enter" aria-label="Отправить сообщение" disabled>
+                  <span class="send-label">Отправить</span><span class="send-arrow" aria-hidden="true">↑</span>
+                </button>
+              </div>
             </div>
           </form>
+          <p id="compose-hint" class="compose-hint">Enter — отправить <span aria-hidden="true">·</span> Shift + Enter — новая строка</p>
           <div id="notice" class="notice" role="status" hidden></div>
         </div>
         <div id="drop-context" class="drop-context" hidden>Отпустите файлы, чтобы выбрать вложения</div>
