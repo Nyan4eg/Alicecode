@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store } from '../app/store.mjs';
@@ -25,7 +25,7 @@ test('project commands stream output before exit, repeat in a nested directory, 
     const run = await runs.start({ chatId: chat.id, projectId: chat.projectId, root, profile, key: 'test' });
     await until(() => output.some(run => run.status === 'in_progress' && run.output.includes('FIRST')));
     await until(() => !runs.active.has(run.id));
-    const result = store.command(run.id); assert.equal(result.exitCode, 7); assert.equal(result.status, 'failed'); assert.ok(result.output.includes('LAST') && result.output.includes('Проверка')); assert.equal(result.cwd, folder);
+    const result = store.command(run.id); assert.equal(result.exitCode, 7); assert.equal(result.status, 'failed'); assert.ok(result.output.includes('LAST') && result.output.includes('Проверка')); assert.equal(result.cwd, await realpath(folder));
     const server = join(root, 'server.cjs'); await writeFile(server, 'console.log("READY");setInterval(()=>{},1000);');
     const live = await runs.start({ chatId: chat.id, projectId: chat.projectId, root, profile: {}, command: commandFor(server), cwd: '.' });
     await until(() => store.command(live.id).output.includes('READY'));
