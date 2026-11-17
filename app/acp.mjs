@@ -7,9 +7,9 @@ import { createInterface } from 'node:readline';
 import { alias, startAdapter } from './adapter.mjs';
 import { defaultModel } from './models.mjs';
 
-export async function startRuntime(home, credentials, model = defaultModel) {
+export async function startRuntime(home, credentials, model = defaultModel, onRequest = () => {}) {
   // Keep the ACP model alias stable so existing sessions can load after a model change.
-  const adapter = await startAdapter({ ...credentials, modelId: model.id });
+  const adapter = await startAdapter({ ...credentials, modelId: model.id, onRequest });
   const dispose = () => {
     adapter.server.close();
     adapter.server.closeAllConnections();

@@ -46,6 +46,7 @@ window.aliceEditor = {
     return {
       position: () => ({ selection: { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head }, scrollTop: view.scrollDOM.scrollTop }),
       focus: () => view.focus(),
+      select(start, length = 0) { const anchor = Math.max(0, Math.min(view.state.doc.length, start)); view.dispatch({ selection: { anchor, head: Math.min(view.state.doc.length, anchor + length) }, scrollIntoView: true }); },
       destroy: () => view.destroy(),
       search: () => openSearchPanel(view),
       go: () => gotoLine(view),

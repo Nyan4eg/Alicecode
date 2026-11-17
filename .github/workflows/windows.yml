@@ -43,6 +43,9 @@ jobs:
           $version = node -p "require('./package.json').version"
           $installer = "Alicecode-Setup-$version-x64.exe"
           $files = @("dist/$installer", "dist/$installer.blockmap", 'dist/latest.yml')
+          foreach ($analyzerFile in @('dist/win-unpacked/resources/typescript-lib/lib.es2022.full.d.ts', 'dist/win-unpacked/resources/typescript-lib/lib.dom.d.ts', 'dist/win-unpacked/resources/app.asar.unpacked/app/code-worker.mjs')) {
+            if (-not (Test-Path -LiteralPath $analyzerFile -PathType Leaf)) { throw "Missing packaged analyzer resource: $analyzerFile" }
+          }
           foreach ($file in $files) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing $file" }
           }

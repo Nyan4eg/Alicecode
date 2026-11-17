@@ -51,10 +51,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS project_profiles (projectId TEXT PRIMARY KEY REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS command_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_workspaces (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, chatId TEXT, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS api_requests (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS project_analysis (root TEXT PRIMARY KEY, data TEXT NOT NULL);
       UPDATE messages SET status='cancelled' WHERE status='running';
     `);
     this.addColumns('chats', { renamed: 'INTEGER NOT NULL DEFAULT 0', modelId: 'TEXT', archivedAt: 'INTEGER', mode: "TEXT NOT NULL DEFAULT 'code'",
-      approval: "TEXT NOT NULL DEFAULT 'ask'", planning: 'INTEGER NOT NULL DEFAULT 0', draftPlan: 'TEXT', workspace: 'TEXT' });
+      approval: "TEXT NOT NULL DEFAULT 'ask'", planning: 'INTEGER NOT NULL DEFAULT 0', draftPlan: 'TEXT', workspace: 'TEXT', pins: "TEXT NOT NULL DEFAULT '[]'", summary: 'TEXT' });
     this.addColumns('messages', { modelId: 'TEXT', attachments: "TEXT NOT NULL DEFAULT '[]'", mode: "TEXT NOT NULL DEFAULT 'code'", task: 'TEXT' });
     for (const row of this.db.prepare('SELECT id,projectId,workspace FROM chats WHERE workspace IS NOT NULL').all()) {
       this.db.prepare('INSERT OR IGNORE INTO task_workspaces VALUES (?,?,?,?)').run(row.id, row.projectId, row.id, row.workspace);
@@ -62,6 +64,8 @@ export class Store {
     for (const run of this.commands().filter(run => ['pending', 'in_progress', 'background'].includes(run.status))) {
       this.saveCommand({ ...run, status: 'interrupted', error: 'Перезапуск приложения: состояние процесса не подтверждено.', endedAt: Date.now() });
     }
+    for (const request of this.requests().filter(item => !['done', 'error', 'cancelled', 'interrupted'].includes(item.phase))) this.saveRequest({ ...request, phase: 'interrupted', reason: 'Запрос прерван перезапуском приложения.' });
+    for (const [root, analysis] of Object.entries(this.analyses())) this.saveAnalysis(root, { ...analysis, stale: true });
     for (const row of this.db.prepare("SELECT id,task FROM messages WHERE task IS NOT NULL AND status='cancelled'").all()) {
       const task = JSON.parse(row.task);
       if (['running', 'planning'].includes(task.status)) {
@@ -134,6 +138,18 @@ export class Store {
   }
 
   profile(projectId) { return JSON.parse(this.db.prepare('SELECT data FROM project_profiles WHERE projectId=?').get(projectId)?.data ?? '{}'); }
+  savePins(id, pins) { this.chat(id); this.db.prepare('UPDATE chats SET pins=? WHERE id=?').run(JSON.stringify(pins), id); }
+  saveSummary(id, text, through, root, expected = null) {
+    const chat = this.chat(id);
+    if ((chat.summary?.id ?? null) !== expected) throw new Error('Сводка изменилась. Откройте её заново.');
+    if (typeof text !== 'string' || !text.trim() || text.length > 12000) throw new Error('Сводка должна содержать от 1 до 12000 символов.');
+    const summary = { id: randomUUID(), text: text.trim(), through, root, createdAt: Date.now() };
+    this.db.prepare('UPDATE chats SET summary=?,sessionId=NULL WHERE id=?').run(JSON.stringify(summary), id); return summary;
+  }
+  requests() { return this.db.prepare('SELECT data FROM api_requests ORDER BY rowid DESC LIMIT 200').all().map(row => JSON.parse(row.data)); }
+  saveRequest(value) { this.db.prepare('INSERT INTO api_requests VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(value.id, JSON.stringify(value)); }
+  analyses() { return Object.fromEntries(this.db.prepare('SELECT * FROM project_analysis').all().map(row => [row.root, JSON.parse(row.data)])); }
+  saveAnalysis(root, data) { this.db.prepare('INSERT INTO project_analysis VALUES (?,?) ON CONFLICT(root) DO UPDATE SET data=excluded.data').run(root, JSON.stringify(data)); }
   saveProfile(projectId, profile) {
     if (!this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId)) throw new Error('Проект не найден.');
     this.db.prepare('INSERT INTO project_profiles VALUES (?,?) ON CONFLICT(projectId) DO UPDATE SET data=excluded.data').run(projectId, JSON.stringify(profile));
@@ -200,7 +216,7 @@ export class Store {
       FROM chats JOIN projects ON projects.id=chats.projectId WHERE chats.id=?`).get(id);
     if (!chat) throw new Error('Чат не найден.');
     const workspace = chat.workspace ? JSON.parse(chat.workspace) : null;
-    return { ...chat, projectCwd: chat.cwd, cwd: workspace?.state === 'removed' ? chat.cwd : workspace?.root ?? chat.cwd, workspace,
+    return { ...chat, projectCwd: chat.cwd, cwd: workspace?.state === 'removed' ? chat.cwd : workspace?.root ?? chat.cwd, workspace, pins: JSON.parse(chat.pins), summary: chat.summary ? JSON.parse(chat.summary) : null,
       draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null };
   }
 
@@ -266,6 +282,7 @@ export class Store {
       this.db.prepare('DELETE FROM run_reviews WHERE messageId IN (SELECT id FROM messages WHERE chatId=?)').run(id);
       this.db.prepare('DELETE FROM messages WHERE chatId=?').run(id);
       this.db.prepare('DELETE FROM draft_files WHERE chatId=?').run(id);
+      this.db.prepare("DELETE FROM api_requests WHERE json_extract(data,'$.chatId')=?").run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='chat' AND id=?").run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='editor' AND id=?").run(id);
       this.db.prepare('DELETE FROM chats WHERE id=?').run(id);
@@ -398,7 +415,7 @@ export class Store {
     const activeChat = this.setting('activeChat') ?? null;
     const projects = this.db.prepare('SELECT * FROM projects ORDER BY rowid DESC').all();
     const chats = this.db.prepare('SELECT * FROM chats ORDER BY updatedAt DESC, rowid DESC').all()
-      .map(chat => ({ ...chat, workspace: chat.workspace ? JSON.parse(chat.workspace) : null, draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null }));
+      .map(chat => ({ ...chat, pins: JSON.parse(chat.pins), summary: chat.summary ? JSON.parse(chat.summary) : null, workspace: chat.workspace ? JSON.parse(chat.workspace) : null, draftPlan: chat.draftPlan ? JSON.parse(chat.draftPlan) : null }));
     const messages = activeChat ? this.db.prepare(`SELECT messages.*, run_reviews.summary,
       (SELECT json_group_array(DISTINCT path) FROM managed_edits WHERE messageId=messages.id AND state='applied') AS managed
       FROM messages

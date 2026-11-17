@@ -430,6 +430,7 @@ function renderComposer() {
   $('send').disabled = !chat || chat.archivedAt || !state.configured || !available || Boolean(state.busy || state.workspaceMutation)
     || sending || !$('prompt').value.trim();
   renderAttachments();
+  if (typeof renderIntelligence === 'function') renderIntelligence();
   scheduleWorkspaceSave();
 }
 
@@ -1605,6 +1606,7 @@ function showEditor(file, line, focus = true) {
     const changed = file.dirty !== (text !== file.cleanText);
     file.text = text;
     file.dirty = text !== file.cleanText;
+    if (typeof changedCode === 'function') changedCode();
     if (changed) renderEditorTabs();
     scheduleWorkspaceSave();
   }, saveCurrentFile, scheduleWorkspaceSave);

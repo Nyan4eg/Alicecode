@@ -9,6 +9,7 @@
   <script defer src="editor.bundle.js"></script>
   <script defer src="renderer.js"></script>
   <script defer src="workflow.js"></script>
+  <script defer src="intelligence.js"></script>
 </head>
 <body>
   <aside class="sidebar" aria-label="Навигация">
@@ -42,6 +43,7 @@
     </header>
     <div id="taskbar" class="taskbar" hidden>
       <button id="project-instructions" class="quiet" type="button">Инструкции проекта</button>
+      <button id="show-context" class="quiet" type="button">Контекст Алисы</button>
       <button id="create-task-branch" class="quiet" type="button">Отдельная ветка…</button>
       <button id="transfer-task" class="quiet" type="button" hidden>Перенести результат…</button>
       <span id="task-location"></span>
@@ -153,21 +155,30 @@
           <div class="git-actions">
             <button id="editor-find" class="quiet" type="button">Найти</button>
             <button id="editor-line" class="quiet" type="button">К строке</button>
+            <button id="code-back" class="quiet" type="button" title="Назад · Alt+←">←</button>
+            <button id="code-definition" class="quiet" type="button" title="К определению · F12">Определение</button>
+            <button id="code-references" class="quiet" type="button" title="Использования · Shift+F12">Использования</button>
+            <button id="code-symbols" class="quiet" type="button" title="Символы · Ctrl+Shift+O">Символы</button>
           </div>
           <div id="editor-host"></div>
         </section>
       </aside>
     </div>
     <section id="task-drawer" class="task-drawer" hidden aria-label="Задача и команды">
-      <div class="drawer-heading"><div class="drawer-tabs"><button id="drawer-task-tab" class="quiet" type="button">Задача</button><button id="drawer-commands-tab" class="quiet" type="button">Команды</button></div><span id="drawer-caption"></span><button id="close-drawer" class="quiet icon" type="button" aria-label="Скрыть панель">×</button></div>
+      <div class="drawer-heading"><div class="drawer-tabs"><button id="drawer-task-tab" class="quiet" type="button">Задача</button><button id="drawer-commands-tab" class="quiet" type="button">Команды</button><button id="drawer-problems-tab" class="quiet" type="button">Проблемы</button><button id="drawer-context-tab" class="quiet" type="button">Контекст</button><button id="drawer-api-tab" class="quiet" type="button">API</button></div><span id="drawer-caption"></span><button id="close-drawer" class="quiet icon" type="button" aria-label="Скрыть панель">×</button></div>
       <div id="task-overview" class="task-overview"></div>
       <div id="command-console" class="command-console" hidden>
         <div class="command-sidebar"><div id="command-launchers" class="command-launchers"></div><div id="command-history" class="command-history"></div></div>
         <div class="command-detail"><div id="command-heading" class="command-heading"></div><div id="command-location" class="command-location"></div><div id="command-links" class="command-links"></div><pre id="command-output" tabindex="0"></pre></div>
       </div>
+      <div id="problems-panel" class="intelligence-panel" hidden><div class="intelligence-toolbar"><button id="analyze-project" class="quiet" type="button">Проверить JS/TS</button><button id="send-problems" class="quiet" type="button">Выбранное в чат</button><span id="problems-status" role="status"></span></div><div id="problems-list"></div></div>
+      <div id="context-panel" class="intelligence-panel" hidden><div class="intelligence-toolbar"><button id="refresh-context" class="quiet" type="button">Обновить</button><button id="compress-context" class="quiet" type="button">Сжать контекст и продолжить</button><button id="edit-summary" class="quiet" type="button">Сводка…</button><button id="cancel-compression" class="quiet" type="button" hidden>Остановить сжатие</button><span id="context-status" role="status"></span></div><div id="context-list"></div></div>
+      <div id="api-panel" class="intelligence-panel" hidden><p class="panel-note">Ответ проверяется целиком до передачи инструментов агенту. Повторы касаются запроса API; выполненные команды не запускаются повторно приложением. Токены показаны только при наличии данных провайдера.</p><div id="api-list"></div></div>
     </section>
-    <footer class="workbench-status"><button id="show-task" class="quiet" type="button">Задача</button><button id="show-commands" class="quiet" type="button">Команды</button><span id="task-live-status" role="status"></span><button id="project-command-settings" class="quiet" type="button">Команды проекта…</button><button id="manage-task-branches" class="quiet" type="button">Ветки…</button></footer>
+    <footer class="workbench-status"><button id="show-task" class="quiet" type="button">Задача</button><button id="show-commands" class="quiet" type="button">Команды</button><button id="show-problems" class="quiet" type="button">Проблемы</button><button id="show-api" class="quiet" type="button">API</button><span id="task-live-status" role="status"></span><button id="project-command-settings" class="quiet" type="button">Команды проекта…</button><button id="manage-task-branches" class="quiet" type="button">Ветки…</button></footer>
   </main>
+  <dialog id="code-navigation-dialog" class="changes-dialog" aria-labelledby="code-navigation-title"><div class="dialog-header"><h2 id="code-navigation-title">Навигация по коду</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div><input id="code-navigation-filter" placeholder="Фильтр по имени или файлу" aria-label="Фильтр символов"><p id="code-navigation-status" class="muted"></p><div id="code-navigation-results"></div></dialog>
+  <dialog id="summary-dialog" class="changes-dialog" aria-labelledby="summary-title"><form id="summary-form"><div class="dialog-header"><h2 id="summary-title">Сводка для продолжения</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div><p class="muted">Сводка передаётся в следующие запросы как справочный контекст. Сохранение начинает свежую сессию модели; полная история и текущая рабочая папка остаются в чате.</p><textarea id="summary-text" rows="14" maxlength="12000" aria-label="Сводка"></textarea><p id="summary-error" class="error" hidden></p><div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button class="primary" type="submit">Сохранить сводку</button></div></form></dialog>
 
   <dialog id="commands-dialog" class="changes-dialog" aria-labelledby="commands-title">
     <form id="commands-form"><div class="dialog-header"><h2 id="commands-title">Команды проекта</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>

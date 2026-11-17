@@ -141,6 +141,28 @@ kbd { white-space: nowrap; font: 11px var(--code); padding: 1px 4px; border: 1px
 body.resizing { cursor: col-resize; user-select: none; }
 .panes { display: flex; flex: 1; min-height: 0; }
 .workbench-status { display: flex; flex-shrink: 0; min-height: 30px; align-items: center; gap: 4px; padding: 0 10px; border-top: 1px solid var(--line); background: #f7f4fb; }
+.intelligence-panel { flex: 1; min-height: 0; overflow: auto; padding: 8px 14px; font-size: 12px; }
+.intelligence-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; margin-bottom: 8px; position: sticky; top: -8px; background: #fff; z-index: 1; padding: 4px 0; }
+.intelligence-toolbar button { font-size: 11px; padding: 4px 7px; }
+.intelligence-toolbar span, .panel-note { font-size: 11px; color: var(--muted); }
+.problem-row { display: flex; align-items: flex-start; gap: 9px; border-bottom: 1px solid var(--line); padding: 7px 0; }
+.problem-row input { flex: 0 0 14px; width: 14px; margin: 7px 0 0; }
+.problem-location { flex: 1; min-width: 0; border: 0; border-radius: 5px; text-align: left; background: transparent; color: inherit; font-size: 12px; padding: 3px 5px; }
+.problem-location:hover { background: #f6f1fb; } .problem-location small { display: block; font-size: 10px; margin-top: 4px; }
+.problem-code { font: 10px var(--code); background: #f9eaf0; color: #a34460; padding: 2px 5px; border-radius: 4px; margin-right: 7px; }
+.context-block { border-bottom: 1px solid var(--line); padding: 5px 0; } .context-block summary { cursor: pointer; color: #655276; }
+.context-block pre { max-height: 200px; margin: 7px 0; font-size: 11px; }
+.context-ref { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 8px; padding: 5px 0; border-bottom: 1px solid #f0edf5; }
+.context-ref span { overflow-wrap: anywhere; } .context-ref.stale { color: #a34460; } .context-ref small { color: var(--muted); }
+.context-ref button { font-size: 10px; padding: 3px 6px; }
+.api-request { border-bottom: 1px solid var(--line); padding: 6px 0; } .api-request summary { cursor: pointer; }
+.api-error summary, .retry-note { color: #a34460; } .api-retry summary { color: #94722a; } .api-done summary { color: #2f7b56; }
+.api-request p { font-size: 11px; margin: 5px 0; }
+.code-location { display: flex; flex-direction: column; text-align: left; width: 100%; padding: 9px; border: 0; border-bottom: 1px solid var(--line); background: #fff; }
+.code-location:hover { background: #f4eefb; } .code-location span { font-size: 11px; margin-top: 3px; }
+#code-navigation-results { max-height: 48vh; overflow: auto; } #summary-text { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 8px; font: 12px/1.6 var(--code); }
+.drawer-tabs { overflow-x: auto; flex-shrink: 0; } .drawer-tabs button { white-space: nowrap; }
+@media (max-width: 900px) { .drawer-tabs button { padding: 5px 7px; font-size: 11px; } .drawer-heading { gap: 4px; } .workbench-status { padding: 0 3px; } }
 .workbench-status button { font-size: 11px; padding: 5px 8px; white-space: nowrap; }
 #task-live-status { flex: 1; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-drawer { display: flex; flex-direction: column; flex: 0 0 min(260px, 29vh); min-height: 110px; border-top: 1px solid #d9cee9; background: #fff; overflow: hidden; }

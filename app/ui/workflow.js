@@ -3,7 +3,7 @@ const projectCommandLabels = { prepare: 'Подготовить ветку', ins
 let workflowMode = null, workflowTaskId = null, selectedCommandId = null, commandOriginal = false, commandSettingsTarget;
 const runLabels = { pending: 'Ожидает', in_progress: 'Выполняется', background: 'В фоне', completed: 'Готово', failed: 'Ошибка', interrupted: 'Прервано' };
 function workflowView() { return { mode: workflowMode, messageId: workflowTaskId, commandId: selectedCommandId, original: commandOriginal }; }
-function restoreWorkflow(view = {}) { workflowMode = ['task', 'commands'].includes(view.mode) ? view.mode : null; workflowTaskId = view.messageId; selectedCommandId = view.commandId; commandOriginal = view.original === true; }
+function restoreWorkflow(view = {}) { workflowMode = ['task', 'commands', 'problems', 'context', 'api'].includes(view.mode) ? view.mode : null; workflowTaskId = view.messageId; selectedCommandId = view.commandId; commandOriginal = view.original === true; }
 function openWorkflow(mode) { workflowMode = mode; renderWorkflow(); scheduleWorkspaceSave(); }
 function workflowButton(label, action, className = 'quiet') { const b = element('button', className, label); b.type = 'button'; b.addEventListener('click', action); return b; }
 function currentRoot(chat = activeChat()) { return chat?.workspace?.root ?? state.projects.find(p => p.id === chat?.projectId)?.path; }
@@ -20,6 +20,7 @@ function renderWorkflow() {
   setText('show-commands', 'Команды' + (running.length ? ' · ' + running.length : ''));
   $('task-drawer').hidden = !workflowMode || !chat;
   $('task-overview').hidden = workflowMode !== 'task'; $('command-console').hidden = workflowMode !== 'commands';
+  if (typeof renderIntelligence === 'function') renderIntelligence();
   $('drawer-task-tab').classList.toggle('selected', workflowMode === 'task'); $('drawer-commands-tab').classList.toggle('selected', workflowMode === 'commands');
   setText('drawer-caption', chat?.workspace ? chat.workspace.branch : 'Исходная папка');
   if (workflowMode === 'task') {

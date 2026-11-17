@@ -5,6 +5,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { legacyModel } from './models.mjs';
 import { createProvider, providerError } from './providers.mjs';
+import { completeRequest } from './requests.mjs';
 
 export const alias = 'alice-ai-llm-flash';
 export const modelUri = (folderId, id = legacyModel.id) => `gpt://${folderId}/${id}`;
@@ -31,7 +32,7 @@ async function* normalizeToolIds(body) {
   }
 }
 
-export async function startAdapter({ folderId, modelId = legacyModel.id, track = false, ...credentials }) {
+export async function startAdapter({ folderId, modelId = legacyModel.id, track = false, onRequest = () => {}, ...credentials }) {
   const provider = createProvider(credentials);
   const model = provider.model(folderId, modelId);
   const token = randomUUID();
@@ -65,7 +66,7 @@ export async function startAdapter({ folderId, modelId = legacyModel.id, track =
       }
       const observation = { title, stream: body.stream === true, status: null };
       if (track) requests.push(observation);
-      const { response: upstream, redact } = await provider.request('/chat/completions', {
+      const { response: upstream, redact } = await completeRequest(provider, '/chat/completions', {
         method: 'POST',
         headers: {
           'OpenAI-Project': folderId,
@@ -73,7 +74,7 @@ export async function startAdapter({ folderId, modelId = legacyModel.id, track =
         },
         body: JSON.stringify({ ...body, model }),
         signal: AbortSignal.any([AbortSignal.timeout(90_000), disconnect.signal]),
-      });
+      }, title ? () => {} : onRequest);
       observation.status = upstream.status;
       if (!upstream.ok) {
         const detail = providerError(credentials.mode, upstream.status) ?? redact(await upstream.text()).slice(0, 1_000);

@@ -5,6 +5,18 @@ const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(da
 
 contextBridge.exposeInMainWorld('alicecode', {
   state: invoke('app:state'),
+  codeQuery: invoke('code:query'),
+  staleAnalysis: invoke('code:stale'),
+  onAnalysis: subscribe('analysis:result'),
+  onAnalysisStale: subscribe('analysis:stale'),
+  onApiRequest: subscribe('api:request'),
+  contextDetails: invoke('context:details'),
+  pinContext: invoke('context:pin'),
+  unpinContext: invoke('context:unpin'),
+  refreshPin: invoke('context:refresh'),
+  compressContext: invoke('context:compress'),
+  cancelCompression: invoke('context:cancel'),
+  saveSummary: invoke('context:save-summary'),
   saveProjectCommands: invoke('project:commands'),
   startCommand: invoke('command:start'),
   stopCommand: invoke('command:stop'),

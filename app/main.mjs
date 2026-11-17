@@ -3,6 +3,7 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { watch } from 'node:fs';
 import { Store } from './store.mjs';
 import { AcpClient, startRuntime } from './acp.mjs';
 import { alias } from './adapter.mjs';
@@ -25,6 +26,9 @@ import { agentEdit, agentTextForDisk, editDiff, editableFile, editorText, planRo
 import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from './git.mjs';
 import { Attachments } from './attachments.mjs';
 import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
+import { monitoredProvider } from './requests.mjs';
+import { codeQuery } from './code-service.mjs';
+import { inspectFragments, suggestContext, summarize, summaryPrompt } from './conversation-context.mjs';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const cancelledPermission = () => ({ outcome: { outcome: 'cancelled' } });
@@ -36,6 +40,7 @@ let window;
 let store;
 let attachments;
 let commands;
+let compression;
 let credentials;
 let credentialError;
 let providerMode = keyMode;
@@ -46,6 +51,37 @@ let workspaceMutation = false;
 let available = models;
 let catalogStatus = 'loading';
 const updates = createUpdates(state => emit('app:update', state));
+const requestOwners = new Map(), analysisWatchers = new Map(), revisions = new Map();
+function requestObserver(owner = null) {
+  return event => {
+    let previous = requestOwners.get(event.id);
+    if (!previous) {
+      const target = owner ?? (active ? { chatId: active.chatId, messageId: active.message.id, kind: active.stage } : null);
+      if (!target) return;
+      previous = { ...target }; requestOwners.set(event.id, previous);
+    }
+    const events = [...(previous.events ?? []), { phase: event.phase, attempt: event.attempt, reason: event.reason?.slice(0, 500), elapsedMs: event.elapsedMs }].slice(-12);
+    const value = { ...previous, ...event, events, reason: event.reason?.slice(0, 500) };
+    requestOwners.set(event.id, value); store.saveRequest(value); emit('api:request', value);
+    if (['done', 'error', 'cancelled'].includes(event.phase)) requestOwners.delete(event.id);
+  };
+}
+function taskProvider(owner = null) { return monitoredProvider(createProvider(credentials), requestObserver(owner)); }
+function staleAnalysis(root) {
+  revisions.set(root, (revisions.get(root) ?? 0) + 1);
+  const data = store.analyses()[root];
+  if (data && !data.stale) { store.saveAnalysis(root, { ...data, stale: true }); emit('analysis:stale', root); }
+}
+function watchAnalysis(root) {
+  if (analysisWatchers.has(root)) return;
+  try {
+    const watcher = watch(root, { recursive: true }, (_event, file) => {
+      if (file && file.split(/[\\/]/).some(part => ['node_modules', '.git', 'dist', 'build', '.venv'].includes(part))) return;
+      staleAnalysis(root);
+    }); watcher.on('error', () => {}); analysisWatchers.set(root, watcher);
+    if (analysisWatchers.size > 8) { const [old, prior] = analysisWatchers.entries().next().value; prior.close(); analysisWatchers.delete(old); }
+  } catch {}
+}
 
 function snapshot() {
   const providerSettings = Object.fromEntries([...connections].map(([mode, value]) => [mode, {
@@ -57,6 +93,7 @@ function snapshot() {
     editorStates: store.workspaceStates('editor'),
     projectProfiles: Object.fromEntries(store.snapshot().projects.map(project => [project.id, commandProfile(store.profile(project.id))])),
     commandRuns: store.commands(), taskWorkspaces: store.taskWorkspaces(),
+    apiRequests: store.requests(), analyses: store.analyses(),
     draftFiles: Object.fromEntries([...attachments.drafts].map(([id, files]) => [id, [...files.values()].map(({ text, ...file }) => file)])),
     busy: active?.chatId ?? null, busyStage: active?.stage ?? null, permission: active?.permissions[0]?.details ?? null,
     workspaceMutation,
@@ -359,7 +396,9 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
   if (!credentials) throw new Error('Настройте подключение к Yandex.');
   const text = typeof input === 'string' ? input.trim() : '';
   if (!text || text.length > 40_000) throw new Error('Введите сообщение до 40 000 символов.');
-  const context = await resolveContext(store.chat(chatId).cwd, refs);
+  const selected = store.chat(chatId);
+  const combined = [...new Map([...selected.pins, ...refs].map(ref => [ref.path + ':' + ref.start + ':' + ref.end, ref])).values()];
+  const context = await resolveContext(selected.cwd, combined);
   const external = attachments.files(chatId, externalIds);
   assertIdle();
   const chat = store.select(chatId);
@@ -372,7 +411,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
   const profile = commandProfile(store.profile(chat.projectId));
   const commandEnv = chat.mode === 'code' ? await commandEnvironment(profile) : null;
   assertIdle();
-  const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot, profile,
+  const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot, profile, summary: chat.summary,
     source: resume?.source ?? text, steps: resume?.steps?.map(step => ({ ...step, status: step.status === 'done' ? 'done' : 'pending' })) ?? [], status: 'running' };
   const message = {
     id: store.beginTurn(chatId, text, model.id, [...context.map(({ path, start, end }) => ({ path, start, end })),
@@ -399,11 +438,12 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
         .map(file => JSON.stringify(file.label) + ': ' + JSON.stringify(attachments.path(chatId, file).replaceAll('\\', '/'))).join('\n') : '';
     const instructionText = instructionsPrompt(instructionSnapshot);
     if (chat.mode === 'discuss') {
-      const history = store.db.prepare("SELECT role,text FROM messages WHERE chatId=? AND id<? AND text<>'' ORDER BY id DESC LIMIT 24")
-        .all(chatId, message.id - 1).reverse().map(item => ({ role: item.role, content: item.text.slice(-12000) }));
-      const provider = createProvider(credentials);
+      const history = store.db.prepare("SELECT role,text FROM messages WHERE chatId=? AND id>? AND id<? AND text<>'' ORDER BY id DESC LIMIT 24")
+        .all(chatId, chat.summary?.through ?? 0, message.id - 1).reverse().map(item => ({ role: item.role, content: item.text.slice(-12000) }));
+      const provider = taskProvider();
       await discuss({ root: chat.cwd, provider, model: provider.model(credentials.folderId, model.id), folderId: credentials.folderId,
-        history, prompt: [instructionText, text, referenceCatalog, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)].join('\n\n'),
+        history,
+        prompt: [instructionText, summaryPrompt(chat.summary), text, referenceCatalog, ...context.map(contextPrompt), ...attachments.prompt(chatId, external)].join('\n\n'),
         signal: turn.abort.signal,
         readAttachment: path => attachments.read(chatId, turn.attachments, path),
         onText: text => { message.text += (message.text ? '\n\n' : '') + text; publishTurn(turn); },
@@ -414,14 +454,14 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
     if (chat.planning && !resume) {
       turn.stage = 'plan'; task.status = 'planning'; publishTurn(turn); emit('app:state', snapshot());
       const draft = chat.draftPlan?.source === text ? chat.draftPlan
-        : await generatePlan(createProvider(credentials), createProvider(credentials).model(credentials.folderId, model.id), credentials.folderId, text, instructionSnapshot, turn.abort.signal);
+        : await generatePlan(taskProvider(), createProvider(credentials).model(credentials.folderId, model.id), credentials.folderId, text, instructionSnapshot, turn.abort.signal);
       task.steps = validatePlan(draft.steps); task.status = 'running';
       store.setDraftPlan(chatId, null); publishTurn(turn);
     }
     if (turn.stop) return;
     turn.stage = 'agent'; emit('app:state', snapshot());
     if (runtime && runtime.modelId !== model.id) closeRuntime();
-    runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model);
+    runtime ??= await startRuntime(join(app.getPath('userData'), 'agent'), credentials, model, requestObserver());
     if (turn.stop) return;
     turn.client = new AcpClient(chat.cwd, { ...runtime, env: { ...runtime.env, ...(commandEnv ? Object.fromEntries(Object.entries(commandEnv).filter(([key]) => key.toLowerCase() === 'path')) : {}) } }, {
       onUpdate: update => updateTurn(turn, update),
@@ -445,8 +485,8 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null) {
       store.setSession(chatId, turn.sessionId);
     }
     if (turn.stop) return;
-    const discussion = store.db.prepare("SELECT text FROM messages WHERE chatId=? AND mode='discuss' AND role='assistant' AND status='done' ORDER BY id DESC LIMIT 1").get(chatId)?.text;
-    const common = [instructionText, commandsPrompt(profile, chat.cwd), referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)];
+    const discussion = store.db.prepare("SELECT text FROM messages WHERE chatId=? AND id>? AND mode='discuss' AND role='assistant' AND status='done' ORDER BY id DESC LIMIT 1").get(chatId, chat.summary?.through ?? 0)?.text;
+    const common = [instructionText, summaryPrompt(chat.summary), commandsPrompt(profile, chat.cwd), referenceCatalog, ...(discussion ? ['Предыдущее обсуждение в этом чате (справочный контекст):\n' + discussion.slice(-20000)] : []), ...context.map(contextPrompt), ...attachments.prompt(chatId, external)];
     const run = async text => {
       const length = message.text.length, count = turn.tools.size;
       const result = await turn.client.request('session/prompt', { sessionId: turn.sessionId,
@@ -627,6 +667,65 @@ if (!app.requestSingleInstanceLock()) {
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
+    bind('code:query', async (id, action, input = {}) => {
+      if (!['diagnostics', 'definition', 'references', 'symbols'].includes(action)) throw new Error('Неизвестное действие анализа.');
+      const root = selectedPath(id); watchAnalysis(root); const version = revisions.get(root) ?? 0;
+      const result = await codeQuery(root, action, input);
+      if (action === 'diagnostics') {
+        const data = { ...result, root, checkedAt: Date.now(), stale: (revisions.get(root) ?? 0) !== version, overlays: (input.overlays ?? []).map(file => file.path) };
+        store.saveAnalysis(root, data); emit('analysis:result', data); return data;
+      }
+      return result;
+    });
+    bind('code:stale', id => staleAnalysis(selectedPath(id)));
+    bind('context:details', async (id, refs = [], externalIds = [], file = null, query = '') => {
+      const chat = store.chat(id), instructions = await projectInstructions(chat.cwd);
+      const pins = await inspectFragments(chat.cwd, chat.pins);
+      const drafts = await inspectFragments(chat.cwd, refs);
+      const external = attachments.files(id, externalIds).map(({ text, ...item }) => ({ ...item, chars: text.length }));
+      return { root: chat.cwd, instructions, summary: chat.summary, pins, drafts, external,
+        references: store.externalAttachments(id).slice(-32), suggestions: await suggestContext(chat.cwd, file, query),
+        chars: instructions.text.length + (chat.summary?.text.length ?? 0) + [...pins, ...drafts.filter(ref => !pins.some(pin => pin.digest === ref.digest))].reduce((sum, item) => sum + (item.chars ?? 0), 0) + external.reduce((sum, item) => sum + item.chars, 0) };
+    });
+    bind('context:pin', async (id, ref) => {
+      const chat = store.chat(id), [valid] = await resolveContext(chat.cwd, [ref]);
+      const { content, ...pin } = valid;
+      const pins = chat.pins.filter(item => item.path !== pin.path || item.start !== pin.start || item.end !== pin.end);
+      if (pins.length >= 6) throw new Error('Можно закрепить до 6 фрагментов.');
+      pins.push(pin); store.savePins(id, pins); return snapshot();
+    });
+    bind('context:unpin', (id, index) => {
+      const chat = store.chat(id); if (!Number.isInteger(index) || index < 0 || index >= chat.pins.length) throw new Error('Фрагмент не найден.');
+      store.savePins(id, chat.pins.filter((_item, position) => position !== index)); return snapshot();
+    });
+    bind('context:refresh', async (id, index) => {
+      const chat = store.chat(id), pin = chat.pins[index]; if (!pin) throw new Error('Фрагмент не найден.');
+      const { content, ...fresh } = await previewContext(chat.cwd, pin.path, pin.start, pin.end);
+      chat.pins[index] = fresh; store.savePins(id, chat.pins); return snapshot();
+    });
+    bind('context:compress', id => mutateState(async () => {
+      if (!credentials) throw new Error('Настройте подключение к Yandex.');
+      const chat = store.chat(id), model = available.find(item => item.id === chat.modelId);
+      if (!model) throw new Error('Выберите доступную модель.');
+      // Read this chat explicitly; compression must not depend on which chat is currently selected.
+      const rows = store.db.prepare('SELECT * FROM messages WHERE chatId=? AND id>? ORDER BY id DESC LIMIT 80').all(id, chat.summary?.through ?? 0).reverse()
+        .map(row => ({ ...row, tools: JSON.parse(row.tools), task: row.task ? JSON.parse(row.task) : null }));
+      if (!rows.length) throw new Error('Нет новых сообщений для сжатия.');
+      const first = store.db.prepare("SELECT * FROM messages WHERE chatId=? AND id>? AND role='user' ORDER BY id LIMIT 1").get(id, chat.summary?.through ?? 0);
+      if (first && rows[0].id !== first.id) rows.unshift({ ...first, tools: JSON.parse(first.tools), task: first.task ? JSON.parse(first.task) : null });
+      compression = new AbortController();
+      try {
+        const provider = taskProvider({ chatId: id, kind: 'summary' });
+        const text = await summarize(provider, provider.model(credentials.folderId, model.id), credentials.folderId, rows, chat.summary, compression.signal);
+        store.saveSummary(id, text, rows.at(-1).id, chat.cwd, chat.summary?.id ?? null); closeRuntime();
+      } finally { compression = null; }
+    }));
+    bind('context:cancel', () => compression?.abort());
+    bind('context:save-summary', (id, text, expected) => mutateState(() => {
+      const chat = store.chat(id);
+      const through = chat.summary?.through ?? Number(store.db.prepare('SELECT MAX(id) AS id FROM messages WHERE chatId=?').get(id).id ?? 0);
+      store.saveSummary(id, text, through, chat.cwd, expected); closeRuntime();
+    }));
     const taskChat = id => {
       const chat = store.chat(id);
       if (chat.archivedAt) throw new Error('Восстановите чат из архива.');
@@ -698,7 +797,7 @@ if (!app.requestSingleInstanceLock()) {
         if (!credentials) throw new Error('Настройте подключение к Yandex.');
         const model = available.find(m => m.id === chat.modelId);
         if (!model) throw new Error('Выберите доступную модель.');
-        const provider = createProvider(credentials);
+        const provider = taskProvider({ chatId: id, kind: 'plan' });
         plan = await generatePlan(provider, provider.model(credentials.folderId, model.id), credentials.folderId, text, await projectInstructions(chat.cwd), new AbortController().signal);
       }
       store.setDraftPlan(id, plan);
@@ -875,6 +974,7 @@ if (!app.requestSingleInstanceLock()) {
 app.on('window-all-closed', () => app.quit());
 let stoppingCommands = false;
 app.on('before-quit', event => {
+  compression?.abort();
   if (commands?.active.size && !stoppingCommands) {
     event.preventDefault(); stoppingCommands = true;
     void commands.close().finally(() => app.quit());
@@ -895,4 +995,5 @@ app.on('before-quit', event => {
     publishTurn(active);
   }
   closeRuntime();
+  for (const watcher of analysisWatchers.values()) watcher.close();
 });

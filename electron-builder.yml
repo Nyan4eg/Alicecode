@@ -6,7 +6,16 @@ directories:
 files:
   - app/**/*
   - package.json
+asarUnpack:
+  - app/code-worker.mjs
+  - app/workspace.mjs
+  - app/activity.mjs
+  - node_modules/typescript/**
 extraResources:
+  - from: node_modules/typescript/lib
+    to: typescript-lib
+    filter:
+      - '*.d.ts'
   - from: LICENSE
     to: LICENSE.txt
 win:
