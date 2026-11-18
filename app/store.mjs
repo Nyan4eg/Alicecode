@@ -37,6 +37,11 @@ export class Store {
         role TEXT NOT NULL, text TEXT NOT NULL, tools TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL, error TEXT
       );
+      CREATE TABLE IF NOT EXISTS transfers (
+        id TEXT PRIMARY KEY, chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        data TEXT NOT NULL, patches TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS transfers_chat ON transfers(chatId);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS run_reviews (
         messageId INTEGER PRIMARY KEY REFERENCES messages(id), summary TEXT NOT NULL, files TEXT NOT NULL
@@ -82,6 +87,12 @@ export class Store {
         if (step.status === 'pending') step.status = 'skipped';
       }
       this.saveCommand({ ...run, status: 'interrupted', error: 'Перезапуск приложения: состояние процесса не подтверждено.', endedAt: Date.now() });
+    }
+    for (const row of this.db.prepare("SELECT data FROM transfers WHERE json_extract(data,'$.running')=1").all()) {
+      const card = JSON.parse(row.data);
+      card.running = false;
+      for (const check of card.checks) if (['pending','in_progress'].includes(check.status)) check.status = 'interrupted';
+      this.updateTransfer(card);
     }
     for (const request of this.requests().filter(item => !['done', 'error', 'cancelled', 'interrupted'].includes(item.phase))) this.saveRequest({ ...request, phase: 'interrupted', reason: 'Запрос прерван перезапуском приложения.' });
     for (const [root, analysis] of Object.entries(this.analyses())) this.saveAnalysis(root, { ...analysis, stale: true });
@@ -225,6 +236,20 @@ export class Store {
   }
   commands() { return this.db.prepare('SELECT data FROM command_runs ORDER BY rowid DESC LIMIT 500').all().map(row => JSON.parse(row.data)); }
   saveCommand(run) { this.db.prepare('INSERT INTO command_runs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(run.id, JSON.stringify(run)); }
+  transfers(chatId) {
+    return this.db.prepare('SELECT data FROM transfers WHERE chatId=? ORDER BY rowid DESC').all(chatId).map(row => JSON.parse(row.data));
+  }
+  addTransfer(card, patches) {
+    this.db.prepare('INSERT INTO transfers VALUES (?,?,?,?)').run(card.id, card.chatId, JSON.stringify(card), JSON.stringify(patches));
+  }
+  updateTransfer(card) {
+    this.db.prepare('UPDATE transfers SET data=? WHERE id=? AND chatId=?').run(JSON.stringify(card), card.id, card.chatId);
+  }
+  transferPatches(chatId, id) {
+    const row = this.db.prepare('SELECT patches FROM transfers WHERE id=? AND chatId=?').get(id, chatId);
+    if (!row) throw Error('Перенос не найден.');
+    return JSON.parse(row.patches);
+  }
   taskWorkspaces() { return this.db.prepare('SELECT * FROM task_workspaces ORDER BY rowid DESC').all().map(({ data, ...row }) => ({ ...row, ...JSON.parse(data) })); }
   saveTaskWorkspace(id, projectId, chatId, workspace) {
     this.db.prepare('INSERT INTO task_workspaces VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,chatId=excluded.chatId')

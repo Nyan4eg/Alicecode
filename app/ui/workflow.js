@@ -46,6 +46,7 @@ function renderWorkflow() {
     const host = $('task-overview'); host.replaceChildren();
     if (chat) {
       if (typeof renderAffectedChecks === 'function') renderAffectedChecks(host, chat);
+      renderTransferCards(host, chat);
       host.append(profileControls(chat,false));
     }
     const latest = runs.find(run => run.steps && run.profile?.id === chat?.profileId);
@@ -234,8 +235,8 @@ setInterval(() => {
 
 async function showTransferV09() {
   const target = transferTarget = { chatId: state.activeChat, token: null, files: [], resolutions: {} };
-  $('apply-task-transfer').disabled = true; $('transfer-files').replaceChildren();
-  setText('transfer-note', 'Сравниваем результат с исходным проектом…'); $('task-transfer-dialog').showModal();
+  disableTransfer(); $('transfer-files').replaceChildren(); $('transfer-plan').replaceChildren();
+  setText('transfer-note', 'Сравниваем результат с исходным проектом…'); if (!$('task-transfer-dialog').open) $('task-transfer-dialog').showModal();
   try {
     const result = await api.transferPreview(target.chatId); if (target !== transferTarget) return;
     target.token = result.token; target.files = result.files;
@@ -265,19 +266,97 @@ async function showTransferV09() {
   } catch (error) { setText('transfer-note', errorText(error)); }
 }
 function transferSelection() { return [...$('transfer-files').querySelectorAll('[data-transfer-path]:checked')].map(input => input.dataset.transferPath); }
+function disableTransfer() {
+  $('apply-task-transfer').disabled = true;
+  $('transfer-and-check').disabled = true;
+}
+function transferDiffView(patches) {
+  const host = element('div');
+  for (const file of patches) {
+    const group = element('details', 'transfer-file'); group.open = true;
+    group.append(element('summary', '', file.kind + ' · ' + file.path),
+      element('pre', 'context-text', file.patch || 'Изменение пустого файла или окончания строк.'));
+    host.append(group);
+  }
+  return host;
+}
 function refreshTransferSelection() {
-  const target = transferTarget, paths = transferSelection();
-  $('apply-task-transfer').disabled = !target?.token || !paths.length || target.files.some(file => paths.includes(file.path) && file.conflict && (!Object.hasOwn(target.resolutions, file.path) || /^(<<<<<<< |\|\|\|\|\|\|\| |=======$|>>>>>>> )/m.test(target.resolutions[file.path])));
+  const target = transferTarget, paths = transferSelection(), host = $('transfer-plan');
+  clearTimeout(target.timer); const revision = target.revision = (target.revision || 0) + 1;
+  disableTransfer(); host.replaceChildren();
+  if (!target.token || !paths.length) return;
+  if (target.files.some(file => paths.includes(file.path) && file.conflict &&
+    (!Object.hasOwn(target.resolutions, file.path) || /^(<<<<<<< |\|\|\|\|\|\|\| |=======$|>>>>>>> )/m.test(target.resolutions[file.path])))) {
+    host.append(element('p','muted','Для итогового сравнения разрешите выбранные конфликты.')); return;
+  }
+  target.timer = setTimeout(async () => {
+    try {
+      const plan = await api.transferPlan(target.chatId, target.token, paths, target.resolutions);
+      if (target !== transferTarget || revision !== target.revision) return;
+      if (!plan.patches.length) { host.append(element('p','muted','Исходные файлы уже совпадают с результатом.')); return; }
+      host.append(element('h3','','Итоговые изменения в исходной папке'), transferDiffView(plan.patches));
+      for (const check of plan.checks) host.append(element('p','affected-reason',check.name + ' ← ' + check.reasons.join(', ')));
+      if (!plan.checks.length) host.append(element('p','muted','Для выбранных файлов нет настроенных проверок.'));
+      $('apply-task-transfer').disabled = false; $('transfer-and-check').disabled = !plan.checks.length;
+    } catch (error) { if (target === transferTarget && revision === target.revision) setText('transfer-note', errorText(error)); }
+  }, 150);
 }
-async function applyTransferV09() {
-  const target = transferTarget, selection = transferSelection(); $('apply-task-transfer').disabled = true;
+async function applyTransferV09(check = false) {
+  const target = transferTarget, selection = transferSelection(); disableTransfer();
+  const dialog = $('task-transfer-dialog');
+  const editing = [...dialog.querySelectorAll('#transfer-files input, #transfer-files textarea, #transfer-files button, #refresh-transfer')];
+  editing.forEach(control => { control.disabled = true; });
   try {
-    const files = await api.transferTask(target.chatId, target.token, selection, target.resolutions);
-    setText('transfer-note', 'Перенесено файлов: ' + files.length + '. Исходный индекс Git сохранён.'); target.token = null;
-    $('transfer-files').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = true; });
-    const test = state.projectProfiles?.[activeChat().projectId]?.commands.test;
-    if (test) $('transfer-files').prepend(workflowButton('Проверить тесты в исходном проекте', async () => {
-      try { const run = await api.startCommand(target.chatId, 'test', true); selectedCommandId = run.id; mergeCommand(run); $('task-transfer-dialog').close(); openWorkflow('commands'); } catch (error) { toast(error); }
-    }));
-  } catch (error) { setText('transfer-note', errorText(error) + ' Закройте и откройте перенос заново.'); }
+    const card = await api.transferTask(target.chatId, target.token, selection, target.resolutions, true);
+    dialog.close(); openWorkflow('task');
+    if (check && card) await api.transferCheck(target.chatId, card.id);
+  } catch (error) { setText('transfer-note', errorText(error)); }
+  finally { editing.forEach(control => { control.disabled = false; }); }
 }
+function renderTransferCards(host, chat) {
+  for (const card of state.transfers ?? []) {
+    const section = element('section','task-results transfer-card'); section.dataset.transferId = card.id;
+    section.append(element('strong','','Перенос в ' + (card.sourceBranch ?? 'исходный проект')),
+      element('small','muted',new Date(card.createdAt).toLocaleString() + ' · ' + card.branch),
+      element('small','muted',card.root), element('div','',card.files.join(', ')));
+    const details = $('transfer-detail');
+    const showDetail = (title, content) => {
+      setText('transfer-detail-title', title); $('transfer-detail-body').replaceChildren(content); details.showModal();
+    };
+    section.append(workflowButton('Итоговый diff', async () => {
+      try { showDetail('Перенесённые изменения', transferDiffView(await api.transferDiff(chat.id,card.id))); } catch (error) { toast(error); }
+    }));
+    for (const row of card.checks) {
+      const line = element('div','transfer-check'); line.dataset.status = row.status;
+      const status = runLabels[row.status] ?? ({ missing:'Не запускалась', stale:'Устарела', unknown:'Версия неизвестна', skipped:'Пропущена' }[row.status] ?? row.status);
+      line.append(element('span', row.status === 'failed' ? 'error' : '', row.name + ' · ' + status + (row.reused ? ' · актуальный запуск' : '')));
+      line.title = row.reasons.join(', ');
+      if (row.runId) line.append(workflowButton('Журнал', () => { selectedCommandId = row.failure || row.runId; commandOriginal = true; openWorkflow('commands'); }));
+      if (row.problem?.path) line.append(workflowButton(row.problem.path + ':' + row.problem.line, async () => {
+        try {
+          const problem = await api.transferProblem(chat.id,card.id,row.id);
+          const source = element('pre','context-text');
+          for (const [i,text] of problem.content.split(/\r?\n/).entries()) {
+            const span = element('span',i + 1 === problem.line ? 'error' : '', (i + 1) + '  ' + text + '\n'); source.append(span);
+          }
+          showDetail(problem.text, source); source.querySelector('.error')?.scrollIntoView({block:'center'});
+        } catch (error) { toast(error); }
+      }));
+      section.append(line);
+    }
+    if (card.error) section.append(element('p','error',card.error));
+    if (card.preparationId) section.append(workflowButton('Журнал подготовки', () => {
+      selectedCommandId = card.preparationId; commandOriginal = true; openWorkflow('commands');
+    }));
+    if (card.checks.some(row => row.status !== 'completed')) {
+      const button = workflowButton(card.running ? 'Идёт проверка…' : 'Проверить в исходной папке', async () => {
+        button.disabled = true;
+        try { await api.transferCheck(chat.id,card.id); } catch (error) { toast(error); } finally { button.disabled = false; }
+      });
+      button.disabled = card.running; section.append(button);
+    }
+    host.append(section);
+  }
+}
+$('transfer-and-check').addEventListener('click', () => applyTransferV09(true));
+$('refresh-transfer').addEventListener('click', showTransferV09);

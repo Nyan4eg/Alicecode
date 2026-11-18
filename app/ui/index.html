@@ -224,9 +224,13 @@
       <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button id="confirm-task-branch" class="primary" type="submit">Создать рабочую папку</button></div>
     </form>
   </dialog>
+  <dialog id="transfer-detail" class="changes-dialog" aria-labelledby="transfer-detail-title">
+    <div class="dialog-header"><h2 id="transfer-detail-title"></h2><button type="button" class="quiet close-dialog" aria-label="Закрыть">×</button></div>
+    <div id="transfer-detail-body"></div>
+  </dialog>
   <dialog id="task-transfer-dialog" class="changes-dialog" aria-labelledby="task-transfer-title">
     <div class="dialog-header"><h2 id="task-transfer-title">Перенос в исходный проект</h2><button class="quiet icon close-dialog" type="button" aria-label="Закрыть">×</button></div>
-    <p id="transfer-note" class="muted" role="status"></p><div id="transfer-files"></div><div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="apply-task-transfer" class="primary" type="button" disabled>Перенести правки</button></div>
+    <p id="transfer-note" class="muted" role="status"></p><button id="refresh-transfer" class="quiet" type="button">Обновить сравнение</button><div id="transfer-files"></div><section id="transfer-plan" aria-live="polite"></section><div class="dialog-footer"><button class="quiet close-dialog" type="button">Закрыть</button><button id="transfer-and-check" class="primary" type="button" disabled>Перенести и проверить</button><button id="apply-task-transfer" class="quiet" type="button" disabled>Перенести правки</button></div>
   </dialog>
 
   <dialog id="project-dialog" aria-labelledby="project-dialog-title">

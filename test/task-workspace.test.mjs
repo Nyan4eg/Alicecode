@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { gitIn } from '../app/workspace.mjs';
-import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from '../app/task-workspace.mjs';
+import { createTaskWorkspace, transferPreview, resolveTransfer, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from '../app/task-workspace.mjs';
 import { Store } from '../app/store.mjs';
 
 test('a task branch includes staged and unstaged on-disk context, preserves the original index, and transfers only task edits with conflicts checked', async () => {
@@ -115,7 +115,12 @@ test('manual conflict resolutions and selected transfers retain the index, refus
     assert.equal(preview.files.find(file => file.path === 'code.js').resolvable, true);
     assert.equal((await taskWorkspaceDetails(workspace, home)).removable, false);
     await assert.rejects(applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': preview.files[0].conflict }), /маркеры/);
-    await applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': 'const value = 5; // combined\n' });
+    const resolved = await resolveTransfer(preview, ['code.js'], { 'code.js': 'const value = 5; // combined\n' });
+    assert.equal(resolved.length, 1);
+    assert.match(resolved[0].patch, /-const value = 3;/);
+    assert.match(resolved[0].patch, /\+const value = 5; \/\/ combined/);
+    assert.deepEqual(await resolveTransfer(preview, ['code.js'], { 'code.js': 'const value = 3;\n' }), []);
+    await applyTransfer(workspace, preview.token, ['code.js'], { 'code.js': resolved[0].text });
     assert.equal(await readFile(join(repo, 'code.js'), 'utf8'), 'const value = 5; // combined\n');
     await assert.rejects(readFile(join(repo, 'later.txt')));
     assert.deepEqual(await readFile(join(repo, '.git', 'index')), index);
@@ -135,4 +140,24 @@ test('manual conflict resolutions and selected transfers retain the index, refus
     if (workspace) await gitIn(repo, ['worktree', 'remove', '--force', workspace.directory]);
     store?.db.close(); await rm(root, { recursive: true, force: true });
   }
+});
+
+test('a restarted transfer retains the original diff and completed checks and allows interrupted checks to retry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'alicecode-card-'));
+  const db = join(root, 'profile.sqlite');
+  let store = new Store(db);
+  try {
+    const chat = store.addProject('Packages', root);
+    const card = { id: randomUUID(), chatId: chat.id, root, running: true, files: ['shared/types.ts'],
+      checks: [{ id: 'api', status: 'completed', runId: 'api-run' }, { id: 'web', status: 'in_progress' }] };
+    const patches = [{ path: 'shared/types.ts', patch: '+export interface Quote {}' }];
+    store.addTransfer(card, patches);
+    store.db.close(); store = new Store(db);
+    const [saved] = store.transfers(chat.id);
+    assert.equal(saved.running, false);
+    assert.deepEqual(saved.checks, [card.checks[0], { id: 'web', status: 'interrupted' }]);
+    assert.deepEqual(store.transferPatches(chat.id, card.id), patches);
+    store.deleteChat(chat.id);
+    assert.deepEqual(store.transfers(chat.id), []);
+  } finally { store.db.close(); await rm(root, { recursive: true, force: true }); }
 });

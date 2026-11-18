@@ -84,9 +84,16 @@ export async function transferPreview(workspace) {
 export async function applyTransfer(workspace, token, selection = null, resolutions = {}) {
   const preview = await transferPreview(workspace);
   if (preview.token !== token) throw new Error('Файлы изменились или найден конфликт. Проверьте перенос заново.');
+  return writeTransfer(workspace, await resolveTransfer(preview, selection, resolutions));
+}
+
+export async function resolveTransfer(preview, selection, resolutions = {}) {
+  if (selection !== null && !Array.isArray(selection)) throw new Error('Выберите файлы из текущего сравнения.');
   const selected = selection === null ? preview.files : preview.files.filter(file => selection.includes(file.path));
-  if (!Array.isArray(selection ?? []) || selection && (!selection.length || new Set(selection).size !== selection.length || selected.length !== selection.length)) throw new Error('Выберите файлы из текущего сравнения.');
-  for (const file of selected) {
+  if (selection && (!selection.length || new Set(selection).size !== selection.length || selected.length !== selection.length)) throw new Error('Выберите файлы из текущего сравнения.');
+  const result = [];
+  for (const original of selected) {
+    const file = { ...original };
     if (file.conflict) {
       const resolution = resolutions[file.path];
       if (!file.resolvable || typeof resolution !== 'string') throw new Error('Сначала разрешите конфликт: ' + file.path);
@@ -94,11 +101,18 @@ export async function applyTransfer(workspace, token, selection = null, resoluti
       if (/^(<<<<<<< |\|\|\|\|\|\|\| |=======$|>>>>>>> )/m.test(resolution)) throw new Error('В результате остались маркеры конфликта: ' + file.path);
       file.text = textForDisk(file.current.text, resolution);
     }
+    if (file.text !== file.current.text) {
+      if (file.conflict) file.patch = await editDiff(file.current.text, file.text);
+      result.push(file);
+    }
   }
+  return result;
+}
+
+export async function writeTransfer(workspace, selected) {
   const applied = [];
   try {
     for (const file of selected) {
-      if (file.text === file.current.text) continue;
       if (file.text === null) await removeChecked(workspace.originalRoot, file.current);
       else await writeChecked(workspace.originalRoot, file.current, file.text);
       applied.push(file);

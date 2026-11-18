@@ -8,14 +8,14 @@ import { Store } from './store.mjs';
 import { AcpClient, startRuntime } from './acp.mjs';
 import { alias } from './adapter.mjs';
 import { readPrototypeCredentials, validateCredentials } from './credentials.mjs';
-import { createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles, searchContent } from './workspace.mjs';
+import { gitIn, createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles, searchContent } from './workspace.mjs';
 import { discuss } from './discussion.mjs';
 import { consent } from './permissions.mjs';
 import { projectInstructions, profileInstructions, saveInstructions, instructionsPrompt } from './instructions.mjs';
 import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
-import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
+import { createTaskWorkspace, transferPreview, resolveTransfer, writeTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
 import { CommandRuns, commandProfile, commandEnvironment, commandDirectory, commandsPrompt } from './project-commands.mjs';
-import { AffectedChecks } from './affected-checks.mjs';
+import { AffectedChecks, affectedPaths } from './affected-checks.mjs';
 import { discoverProfiles, localProfiles, repositoryProfiles, saveRepositoryProfiles } from './repository-profiles.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
@@ -99,7 +99,7 @@ function snapshot() {
   const saved = store.snapshot(), chat = saved.chats.find(item => item.id === saved.activeChat);
   const profileSets = Object.fromEntries(saved.projects.map(p => [p.id, store.profiles(p.id).map(commandProfile)]));
   return {
-    ...saved, configured: Boolean(credentials), credentialError, profileSets,
+    ...saved, transfers: store.transfers(saved.activeChat ?? ''), configured: Boolean(credentials), credentialError, profileSets,
     chatStates: store.workspaceStates('chat'), projectStates: store.workspaceStates('project'),
     editorStates: store.workspaceStates('editor'),
     projectProfiles: Object.fromEntries(saved.projects.map(p => [p.id, profileSets[p.id].find(profile => p.id === chat?.projectId && profile.id === chat.profileId) ?? profileSets[p.id][0]])),
@@ -921,19 +921,88 @@ if (!app.requestSingleInstanceLock()) {
       const workspace = await createTaskWorkspace(chat.cwd, join(app.getPath('userData'), 'task-workspaces'), id, branch);
       store.setTaskWorkspace(id, workspace);
     }));
+    let openTransfer;
+    const transferChecks = (chat, paths) => store.profiles(chat.projectId).map(commandProfile)
+      .filter(profile => profile.sequence.length)
+      .map(profile => ({ id: profile.id, name: profile.name, reasons: affectedPaths(profile, paths), status: 'missing' }))
+      .filter(check => check.reasons.length);
+    const patchList = files => files.map(file => ({
+      path: file.path, patch: file.patch, kind: file.current.text === null ? 'Создание' : file.text === null ? 'Удаление' : 'Изменение'
+    }));
     bind('task:transfer-preview', async id => {
       const result = await transferPreview(taskChat(id).workspace);
+      openTransfer = { id, ...result };
       return { token: result.token, conflict: result.conflict, files: result.files.map(({ path, patch, conflict, current, text, desired, base, resolvable }) => ({ path, patch, conflict, current: current?.text, desired, base, merged: text, resolvable, changed: !conflict && current?.text !== text })) };
     });
-    bind('task:transfer', (id, token, selection = null, resolutions = {}) => mutateWorkspace(async () => {
+    bind('task:transfer-plan', async (id, token, selection, resolutions) => {
+      if (openTransfer?.id !== id || openTransfer.token !== token) throw Error('Обновите сравнение.');
+      const files = await resolveTransfer(openTransfer, selection, resolutions);
+      return { patches: patchList(files), checks: transferChecks(taskChat(id), files.map(file => file.path)) };
+    });
+    bind('task:transfer', (id, token, selection = null, resolutions = {}, receipt = false) => mutateWorkspace(async () => {
       const chat = taskChat(id), workspace = chat.workspace;
       const before = await transferPreview(workspace);
-      const files = await applyTransfer(workspace, token, selection, resolutions);
+      if (before.token !== token) {
+        const signature = file => JSON.stringify([file.current?.stamp, file.desiredStamp, file.conflict]);
+        const old = new Map((openTransfer?.id === id ? openTransfer.files : []).map(file => [file.path, signature(file)]));
+        const next = new Map(before.files.map(file => [file.path, signature(file)]));
+        const stale = [...new Set([...old.keys(), ...next.keys()])].filter(path => old.get(path) !== next.get(path));
+        throw Error('Сравнение устарело. Обновите его перед переносом. ' + stale.join(', '));
+      }
+      const changes = await resolveTransfer(before, selection, resolutions);
+      const checks = transferChecks(chat, changes.map(file => file.path));
+      const files = await writeTransfer(workspace, changes);
       const transferred = { ...workspace.transferred };
       for (const file of before.files.filter(file => !selection || selection.includes(file.path))) if (file.desiredStamp !== undefined) transferred[file.path] = file.desiredStamp;
-      store.saveTaskWorkspace(id, chat.projectId, id, { ...workspace, transferred, transferredAt: Date.now() });
-      return files;
+      const card = { id: randomUUID(), chatId: id, root: workspace.originalRoot, branch: workspace.branch,
+        sourceBranch: workspace.sourceBranch, files, checks, createdAt: Date.now(), running: false };
+      store.transaction(() => {
+        store.saveTaskWorkspace(id, chat.projectId, id, { ...workspace, transferred, transferredAt: card.createdAt });
+        if (files.length) store.addTransfer(card, patchList(changes));
+      });
+      return receipt ? (files.length ? card : null) : files;
     }));
+    bind('task:transfer-diff', (id, transferId) => store.transferPatches(id, transferId));
+    const transferCard = (id, transferId) => {
+      const card = store.transfers(id).find(item => item.id === transferId);
+      if (!card || card.root !== taskChat(id).projectCwd) throw Error('Исходная папка переноса недоступна.');
+      return card;
+    };
+    bind('task:transfer-problem', async (id, transferId, profileId) => {
+      const card = transferCard(id, transferId), problem = card.checks.find(check => check.id === profileId)?.problem;
+      if (!problem?.path) throw Error('Нет строки ошибки.');
+      return { ...problem, content: await readProjectFile(card.root, problem.path) };
+    });
+    bind('task:transfer-check', async (id, transferId) => {
+      assertIdle();
+      const card = transferCard(id, transferId);
+      const chat = { ...taskChat(id), cwd: card.root, workspace: null };
+      if (card.running || commands.batches.has(id)) throw Error('Проверка уже выполняется.');
+      const ids = card.checks.filter(row => row.status !== 'completed').map(row => row.id);
+      if (!ids.length) return;
+      const save = () => { store.updateTransfer(card); emit('app:state', snapshot()); };
+      card.running = true;
+      for (const row of card.checks) if (ids.includes(row.id)) row.status = 'pending';
+      delete card.error; delete card.preparationId; save();
+      try {
+        const branch = await gitIn(card.root, ['symbolic-ref','--quiet','--short','HEAD']).then(s => s.trim(), () => '(detached)');
+        if (card.sourceBranch && branch !== card.sourceBranch) throw Error('Вернитесь в исходную ветку ' + card.sourceBranch + '.');
+        await affected.run(chat, ids, row => {
+          const check = card.checks.find(item => item.id === row.id);
+          Object.assign(check, { status: row.status, runId: row.runId, reused: row.reused, failure: row.failure, problem: row.problem });
+          save();
+        });
+        const env = await affected.preparation.inspect(chat);
+        if (env.status === 'failed') {
+          card.error = env.reason; card.preparationId = env.runId;
+          for (const row of card.checks) if (row.status === 'pending') row.status = 'skipped';
+        }
+      } catch (error) { card.error = error.message; }
+      finally {
+        for (const row of card.checks) if (['pending','in_progress'].includes(row.status)) row.status = 'interrupted';
+        card.running = false; save();
+      }
+    });
     bind('task:resume', (id, messageId) => {
       const task = store.task(id, messageId);
       if (taskChat(id).mode !== 'code') throw new Error('Переключите чат в режим «Изменить код», чтобы продолжить план.');

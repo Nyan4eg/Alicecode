@@ -10,6 +10,10 @@ function checkSettings(profile) {
     profile.sequence.map(key => [key, profile.commands[key]])]);
 }
 
+export function affectedPaths(profile, paths) {
+  return paths.filter(path => !profile.scope.length || profile.scope.some(scope => path === scope || path.startsWith(scope + '/')));
+}
+
 function firstProblem(run) {
   const lines = (run?.output || run?.error || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   for (const line of lines) {
@@ -43,7 +47,7 @@ export class AffectedChecks {
     for (const profile of this.store.profiles(chat.projectId).map(commandProfile)) {
       if (onlyProfile && onlyProfile !== profile.id) continue;
       if (profile.id === 'all' && !profile.sequence.length) continue;
-      const reasons = (paths ?? []).filter(path => !profile.scope.length || profile.scope.some(scope => path === scope || path.startsWith(scope + '/')));
+      const reasons = affectedPaths(profile, paths ?? []);
       if (profile.sequence.length) for (const path of reasons) uncovered.delete(path);
       const run = this.store.latestSequence(chat.id, chat.cwd, profile.id);
       let status = run?.status ?? 'missing', failure, problem;
@@ -70,7 +74,7 @@ export class AffectedChecks {
     return { rows, uncovered: [...uncovered], git: paths !== null, environment };
   }
 
-  async run(chat, ids) {
+  async run(chat, ids, report) {
     if (!Array.isArray(ids) || !ids.length || ids.some(id => typeof id !== 'string')) throw Error('Выберите профили для проверки.');
     const profiles = this.store.profiles(chat.projectId).map(commandProfile);
     const selected = [...new Set(ids)].map(id => profiles.find(p => p.id === id));
@@ -93,10 +97,18 @@ export class AffectedChecks {
       for (const profile of selected) {
         if (batch.get(chat.id) !== token) break;
         const { rows } = await this.summary(chat, profile.id,environment);
-        if (rows[0]?.status === 'completed') continue;
+        if (rows[0]?.status === 'completed') {
+          report?.({ ...rows[0], reused: true });
+          continue;
+        }
         if (batch.get(chat.id) !== token) break;
         const run = await this.commands.sequence({ chatId: chat.id, projectId: chat.projectId, root: chat.cwd, profile, batch: token,preparedRunId:environment.status === 'ready' ? environment.runId : undefined });
+        report?.({ id: profile.id, status: 'in_progress', runId: run.id });
         await this.commands.active.get(run.id)?.done;
+        if (report) {
+          const outcome = await this.summary(chat, profile.id, environment);
+          report(outcome.rows[0]);
+        }
         if (run.status === 'interrupted') break;
       }
     } finally { if (batch.get(chat.id) === token) batch.delete(chat.id); }

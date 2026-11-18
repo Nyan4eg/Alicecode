@@ -485,3 +485,9 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 #commands-dialog { max-height:88vh; overflow:auto; }
 #composer-profile { min-width:0; max-width:min(190px,46%); text-overflow:ellipsis; }
 #composer-context { padding:2px 4px; }
+
+.transfer-card { display: grid; gap: .45rem; padding: .8rem; overflow-wrap: anywhere; }
+.transfer-check { display: flex; gap: .45rem; flex-wrap: wrap; align-items: center; }
+.transfer-card button { justify-self: start; }
+#transfer-plan:not(:empty) { border-top: 1px solid var(--border, #dad6e5); margin-top: 1rem; padding-top: .5rem; }
+#transfer-detail-body .context-text { max-height: 55vh; overflow: auto; }
