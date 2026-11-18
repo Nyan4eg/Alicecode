@@ -85,6 +85,7 @@ function renderCommandConsole(runs) {
   const chat = activeChat(), profile = state.projectProfiles?.[chat.projectId] ?? { commands: {} };
   const launchers = $('command-launchers'); launchers.replaceChildren();
   launchers.append(profileControls(chat,commandOriginal));
+  if (typeof repositoryControls === 'function') launchers.append(repositoryControls(chat));
   const location = element('label', 'check-label'); const checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = commandOriginal;
   checkbox.addEventListener('change', () => { commandOriginal = checkbox.checked; renderWorkflow(); scheduleWorkspaceSave(); });
   if (chat.workspace) { location.append(checkbox, document.createTextNode('В исходной папке')); launchers.append(location); }
@@ -154,6 +155,16 @@ $('close-drawer').addEventListener('click', () => openWorkflow(null));
 document.addEventListener('keydown', event => {
   if (event.ctrlKey && event.code === 'Backquote' && !document.querySelector('dialog[open]')) { event.preventDefault(); openWorkflow(workflowMode === 'commands' ? null : 'commands'); }
 });
+function showScopePreview() {
+  const target = commandSettingsTarget, chat = activeChat();
+  if (!target || chat?.id !== target.chatId) return;
+  const paths = $('profile-scope').value.split(/\r?\n/).map(p => p.trim().replaceAll('\\','/').replace(/\/+$/,'')).filter(Boolean);
+  const others = state.profileSets[chat.projectId].filter(p => p.id !== target.id && p.sequence.length);
+  const name = $('profile-name').value.trim() || 'Новый профиль';
+  const rows = paths.map(path => path + ' → ' + [name,...others.filter(p => !p.scope.length || p.scope.some(dir => path === dir || path.startsWith(dir + '/'))).map(p => p.name)].join(', '));
+  setText('profile-scope-preview',rows.join(' · '));
+}
+$('profile-scope').addEventListener('input',showScopePreview);
 function openCommandSettings(create = false) {
   const chat = activeChat(); if (!chat || document.querySelector('dialog[open]')) return;
   const profile = create === true ? { id: crypto.randomUUID(), commands: {} } : state.projectProfiles[chat.projectId];
@@ -161,6 +172,7 @@ function openCommandSettings(create = false) {
   $('profile-name').value = profile.name ?? ''; $('profile-name').readOnly = profile.id === 'all';
   $('profile-config').value = profile.config ?? '';
   $('profile-scope').value = (profile.scope ?? []).join('\n');
+  showScopePreview();
   $('profile-sequence').replaceChildren(...[0,1,2].map(i => {
     const select = element('select'); select.setAttribute('aria-label','Шаг ' + (i+1));
     select.add(new Option('—',''));

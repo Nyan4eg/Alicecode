@@ -67,7 +67,12 @@ function drawChecks() {
     line.append(status);
     if (row.reasons.length) {
       const why = element('small','affected-reason',row.reasons[0] + (row.reasons.length > 1 ? ' +' + (row.reasons.length - 1) : ''));
-      why.title = row.reasons.join('\n'); line.append(why);
+      const explanation = path => {
+        const scope = Object.keys(row.links ?? {}).filter(key => key === path || path.startsWith(key + '/')).sort((a,b) => b.length-a.length)[0];
+        return scope ? path + ' → ' + row.links[scope] : path;
+      };
+      why.textContent = explanation(row.reasons[0]) + (row.reasons.length > 1 ? ' +' + (row.reasons.length - 1) : '');
+      why.title = row.reasons.map(explanation).join('\n'); line.append(why);
     }
     if (row.problem && row.status === 'failed') {
       const issue = row.problem;

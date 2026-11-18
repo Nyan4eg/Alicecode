@@ -475,6 +475,11 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 .affected-reason, .affected-error { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .affected-error { color: #a42e49; }
 .affected-checks summary { cursor: pointer; }
+#repo-profiles-dialog { width: min(680px,90vw); }
+#repo-profiles-list { display: grid; gap: 8px; overflow: auto; max-height: 54vh; }
+.repo-profile { display: grid; gap: 4px; padding: 9px; border: 1px solid #e1daec; border-radius: 8px; }
+.repo-profile summary { cursor: pointer; }
+.repo-profile pre { max-height: 150px; overflow: auto; }
 #commands-dialog { max-height:88vh; overflow:auto; }
 #composer-profile { min-width:0; max-width:min(190px,46%); text-overflow:ellipsis; }
 #composer-context { padding:2px 4px; }

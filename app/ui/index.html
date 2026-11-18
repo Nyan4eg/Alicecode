@@ -12,6 +12,7 @@
   <script defer src="intelligence.js"></script>
   <script defer src="review-notes.js"></script>
   <script defer src="affected-checks.js"></script>
+  <script defer src="repository-profiles.js"></script>
 </head>
 <body>
   <aside class="sidebar" aria-label="Навигация">
@@ -191,6 +192,7 @@
       <label>Конфигурация JS/TS<input id="profile-config" maxlength="500" placeholder="Автоматически · или путь от корня, например api/tsconfig.app.json"></label>
       <div class="profile-environment"><label>Рабочая папка внутри проекта<input id="command-directory" placeholder="Например, backend или ."></label><label>Путь к интерпретатору<input id="command-runtime" placeholder="Необязательно: C:\\Program Files\\nodejs\\node.exe"></label></div>
       <label>Файлы и папки для актуальности проверок<textarea id="profile-scope" rows="2" placeholder="По одному пути от корня проекта в строке. Пусто — весь проект."></textarea></label>
+      <small id="profile-scope-preview" class="muted"></small>
       <fieldset><legend>Порядок шагов «Проверить задачу»</legend><div id="profile-sequence"></div><small>По умолчанию выполняются настроенные типы, тесты и сборка.</small></fieldset>
       <div id="command-settings-fields"></div><p id="commands-error" class="error" hidden></p>
       <div class="dialog-footer"><button class="quiet close-dialog" type="button">Отмена</button><button class="primary" type="submit">Сохранить команды</button></div>
@@ -421,6 +423,13 @@
   </dialog>
 
   <div id="global-error" class="toast" role="alert" hidden></div>
+  <dialog id="repo-profiles-dialog" aria-labelledby="repo-profiles-title">
+    <div class="dialog-header"><h2 id="repo-profiles-title">Профили проекта</h2><button type="button" class="quiet close-dialog" aria-label="Закрыть">×</button></div>
+    <p class="muted" id="repo-profiles-location"></p>
+    <div id="repo-profiles-list"></div>
+    <p class="error" id="repo-profiles-error" hidden></p>
+    <div class="dialog-actions" id="repo-profiles-actions"></div>
+  </dialog>
   <dialog id="review-note-dialog">
     <form id="review-note-form">
       <h2>Замечание к коду</h2><p id="note-location"></p><pre class="context-text" id="note-excerpt"></pre>

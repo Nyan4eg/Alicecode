@@ -60,7 +60,7 @@ export class AffectedChecks {
         } else if (status === 'completed') status = 'unknown';
       }
       rows.push({ id: profile.id, name: profile.name, configured: Boolean(profile.sequence.length),
-        reasons, status, runId: run?.id, failure, problem });
+        reasons, links: profile.links, status, runId: run?.id, failure, problem });
     }
     return { rows, uncovered: [...uncovered], git: paths !== null };
   }

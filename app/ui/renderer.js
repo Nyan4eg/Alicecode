@@ -530,6 +530,7 @@ function renderUpdates() {
 }
 
 function updateState(next) {
+  if (next.profileNotice) toast(next.profileNotice);
   const previous = state;
   const previousChat = previous?.chats.find(item => item.id === previous.activeChat);
   const nextChat = next.chats.find(item => item.id === next.activeChat);

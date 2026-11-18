@@ -16,6 +16,7 @@ import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
 import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
 import { CommandRuns, commandProfile, commandEnvironment, commandDirectory, commandsPrompt } from './project-commands.mjs';
 import { AffectedChecks } from './affected-checks.mjs';
+import { discoverProfiles, localProfiles, repositoryProfiles, saveRepositoryProfiles } from './repository-profiles.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
@@ -23,7 +24,7 @@ import { finishReview, startReview } from './review.mjs';
 import { replayDetails, runTest, testInvocation } from './replay.mjs';
 import { defaultModel, fetchModels, legacyModel, models, modelsFor } from './models.mjs';
 import { normalizeLayout } from './layout.mjs';
-import { agentEdit, agentTextForDisk, editDiff, editableFile, editorText, planRollback, textForDisk, validateText, writeChecked } from './editing.mjs';
+import { agentEdit, agentTextForDisk, editDiff, editableFile, editorText, fingerprint, planRollback, textForDisk, validateText, writeChecked } from './editing.mjs';
 import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from './git.mjs';
 import { Attachments } from './attachments.mjs';
 import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
@@ -82,6 +83,7 @@ function watchAnalysis(root) {
     const watcher = watch(root, { recursive: true }, (_event, file) => {
       if (file && file.split(/[\\/]/).some(part => ['node_modules', '.git', '.venv'].includes(part))) return;
       emit('checks:changed', root);
+      if (!file || file.replaceAll('\\','/').toLowerCase().startsWith('.alicecode')) emit('profiles:changed',root);
       if (file && file.split(/[\\/]/).some(part => ['dist', 'build'].includes(part))) return;
       staleAnalysis(root);
     }); watcher.on('error', () => {}); analysisWatchers.set(root, watcher);
@@ -769,11 +771,41 @@ if (!app.requestSingleInstanceLock()) {
       if (active?.cwd === workspace.root || commands.batches.has(workspace.chatId) || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) throw new Error('Сначала остановите задачу и команды в этой рабочей папке.');
       if (store.workspaceStates('editor')[workspace.id]?.files?.some(file => file.dirty)) throw new Error('В редакторе задачи есть несохранённые файлы. Сохраните их перед очисткой.');
     };
-    bind('project:commands', (id, value) => {
-      const chat = taskChat(id); if (active?.chatId === id) throw new Error('Завершите задачу перед изменением команд.');
+    const editableProfiles = id => {
+      const chat = taskChat(id);
+      if (active && store.chat(active.chatId).projectId === chat.projectId) throw new Error('Завершите задачу перед изменением команд.');
       if ([...commands.batches.keys()].some(chatId => store.chat(chatId).projectId === chat.projectId)) throw Error('Дождитесь завершения проверки пакетов.');
-      store.putProfile(chat, commandProfile(value)); return snapshot();
+      return chat;
+    };
+    bind('project:commands', (id, value) => {
+      const chat = editableProfiles(id), prior = store.profiles(chat.projectId).find(p => p.id === value.id);
+      store.putProfile(chat, commandProfile({ ...value, links: prior?.links })); return snapshot();
     });
+    const discover = async chat => {
+      const local = localProfiles(store,chat.projectId);
+      const profiles = await discoverProfiles(chat.projectCwd,local);
+      return { profiles, local, token: fingerprint(JSON.stringify([profiles,local])) };
+    };
+    bind('profiles:discover', id => discover(store.chat(id)));
+    bind('profiles:adopt', (id, ids, token) => mutateState(async () => {
+      const chat = editableProfiles(id), preview = await discover(chat);
+      if (preview.token !== token) throw Error('Настройки пакетов изменились. Повторите поиск.');
+      const selected = preview.profiles.filter(p => ids.includes(p.id));
+      if (!selected.length || selected.length !== ids.length) throw Error('Выберите найденные пакеты.');
+      store.importProfiles(chat.projectId,selected,false);
+    }));
+    bind('profiles:compare', id => {
+      const chat = store.chat(id);
+      watchAnalysis(chat.projectCwd);
+      return repositoryProfiles(store,chat);
+    });
+    bind('profiles:sync', (id, direction, token) => mutateState(async () => {
+      const chat = editableProfiles(id);
+      if (direction === 'save') return saveRepositoryProfiles(store,chat,token);
+      const current = await repositoryProfiles(store,chat);
+      if (direction !== 'load' || current.repo === null || current.token !== token) throw Error('Конфигурация изменилась. Откройте сравнение заново.');
+      store.importProfiles(chat.projectId,current.repo,true);
+    }));
     bind('command:profile', (id, profileId) => {
       taskChat(id); if (active?.chatId === id || workspaceMutation) throw Error('Дождитесь завершения текущей операции.');
       store.selectProfile(id, profileId); return snapshot();
@@ -921,7 +953,14 @@ if (!app.requestSingleInstanceLock()) {
       const result = await dialog.showOpenDialog(window, { properties: ['openDirectory'] });
       if (result.canceled) return snapshot();
       const path = await realpath(result.filePaths[0]);
-      store.addProject(basename(path) || path, path);
+      const existing = store.db.prepare('SELECT id FROM projects WHERE path=?').get(path);
+      const chat = store.addProject(basename(path) || path, path);
+      if (!existing) {
+        try {
+          const { repo } = await repositoryProfiles(store,chat);
+          if (repo !== null) store.importProfiles(chat.projectId,repo,true);
+        } catch (error) { return { ...snapshot(), profileNotice: error.message }; }
+      }
       return snapshot();
     });
     bind('project:reveal', chatId => shell.openPath(selectedPath(chatId)));

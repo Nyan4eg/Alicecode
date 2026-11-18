@@ -169,10 +169,28 @@ export class Store {
   }
   putProfile(chat, profile) {
     this.transaction(() => {
-      if (profile.id === 'all') this.saveProfile(chat.projectId,profile);
-      else this.db.prepare('INSERT INTO package_profiles VALUES (?,?,?) ON CONFLICT(projectId,id) DO UPDATE SET data=excluded.data')
-        .run(chat.projectId,profile.id,JSON.stringify(profile));
+      this.writeProfile(chat.projectId, profile);
       this.selectProfile(chat.id,profile.id);
+    });
+  }
+  writeProfile(projectId, profile) {
+    if (profile.id === 'all') this.saveProfile(projectId,profile);
+    else this.db.prepare('INSERT INTO package_profiles VALUES (?,?,?) ON CONFLICT(projectId,id) DO UPDATE SET data=excluded.data')
+      .run(projectId,profile.id,JSON.stringify(profile));
+  }
+  importProfiles(projectId, profiles, replace) {
+    this.transaction(() => {
+      const existing = this.profiles(projectId);
+      if (replace) {
+        this.db.prepare('DELETE FROM package_profiles WHERE projectId=?').run(projectId);
+        this.db.prepare('DELETE FROM project_profiles WHERE projectId=?').run(projectId);
+        if (existing[0].runtime && !profiles.some(p => p.id === 'all')) this.saveProfile(projectId, { runtime: existing[0].runtime });
+      }
+      for (const profile of profiles) {
+        const prior = existing.find(p => (p.id ?? 'all') === profile.id);
+        this.writeProfile(projectId, { ...profile, runtime: prior?.runtime ?? '' });
+      }
+      if (replace) this.db.prepare("UPDATE chats SET profileId='all' WHERE projectId=? AND profileId<>'all' AND profileId NOT IN (SELECT id FROM package_profiles WHERE projectId=?)").run(projectId,projectId);
     });
   }
   savePins(id, pins) { this.chat(id); this.db.prepare('UPDATE chats SET pins=? WHERE id=?').run(JSON.stringify(pins), id); }

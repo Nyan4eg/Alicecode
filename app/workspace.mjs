@@ -101,11 +101,15 @@ async function* walkFiles(root, path = '') {
 
 const foldPath = value => value.normalize('NFKC').toLowerCase().replaceAll('\\', '/');
 
+export async function projectFiles(root) {
+  return await gitFiles(root) ?? walkFiles(root);
+}
+
 export async function searchFiles(root, query) {
   const needle = foldPath(typeof query === 'string' ? query.trim().slice(0, 240) : '');
   const words = needle.split(/\s+/).filter(Boolean);
   const matches = [];
-  for await (const path of await gitFiles(root) ?? walkFiles(root)) {
+  for await (const path of await projectFiles(root)) {
     const key = foldPath(path);
     if (!words.every(word => key.includes(word))) continue;
     const name = key.split('/').at(-1);

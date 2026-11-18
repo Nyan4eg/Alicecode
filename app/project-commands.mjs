@@ -22,7 +22,10 @@ export function commandProfile(value = {}) {
   if (!name || !/^(all|[a-zA-Z0-9_-]{1,64})$/.test(id)) throw Error('Некорректный профиль.');
   const config = text(value.config ?? '',500).replaceAll('\\','/');
   if (config && (!config.endsWith('.json') || /[:*?]/.test(config) || config.split('/').some(part => !part || part === '..'))) throw Error('Укажите путь к файлу JSON от корня проекта.');
-  return { id, name, commands, directory, config, scope, sequence, runtime: text(value.runtime ?? '', 1000) };
+  const links = Object.fromEntries(scope.filter(path => Object.hasOwn(value.links ?? {}, path))
+    .map(path => [path, text(value.links[path], 1000)]));
+  return { id, name, commands, directory, config, scope, sequence, runtime: text(value.runtime ?? '', 1000),
+    ...(Object.keys(links).length ? { links } : {}) };
 }
 export async function commandEnvironment(profile) {
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
