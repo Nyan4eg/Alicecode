@@ -799,7 +799,7 @@ if (!app.requestSingleInstanceLock()) {
       if (!row || commands.batches.has(id)) throw Error('Повторите проверку на текущем коде.');
       const profile = store.profiles(chat.projectId).map(commandProfile).find(item => item.id === row.id);
       const config = await profileConfig(chat.cwd, profile);
-      const prompt = ['Исправь ошибку проверки в пакете «' + profile.name + '». Соблюдай правила пакета. Ограничь исправление его исходниками, сохрани поведение соседних пакетов.',
+      const prompt = ['Исправь ошибку проверки в пакете «' + profile.name + '». Примени корневые инструкции и правила пакета. Внеси минимальную правку в его исходники, сохрани существующие комментарии и публичный интерфейс. Перед ответом просмотри diff и сверь его с обоими наборами инструкций.',
         'Рабочая папка: ' + run.cwd, 'Конфигурация: ' + (config || 'по умолчанию'), 'Команда: ' + run.command,
         'Первая ошибка: ' + row.problem.text, 'Вывод проверки:\n' + run.output.slice(-12000)].join('\n');
       return send(id, prompt, [], [], null, [], profile);
