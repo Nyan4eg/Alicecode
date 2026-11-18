@@ -47,6 +47,7 @@ export function commandsPrompt(profile, root) {
 
 export class CommandRuns {
   active = new Map();
+  batches = new Map();
   constructor(store, publish) { this.store = store; this.publish = publish; }
   save(run) { this.store.saveCommand(run); this.publish(run); }
   async fingerprint(root, profile) {
@@ -59,7 +60,7 @@ export class CommandRuns {
   async sequence(details) {
     const profile = commandProfile(details.profile);
     if (!profile.sequence.length) throw Error('Настройте шаги проверки в командах проекта.');
-    if ([...this.active.values()].some(({ run }) => run.steps && run.chatId === details.chatId)) throw Error('Проверка уже выполняется.');
+    if (this.batches.get(details.chatId) !== details.batch || [...this.active.values()].some(({ run }) => run.steps && run.chatId === details.chatId)) throw Error('Проверка уже выполняется.');
     const run = { id: randomUUID(), chatId: details.chatId, projectId: details.projectId, root: details.root,
       cwd: details.root, profile, command: 'Проверить задачу', source: 'sequence', status: 'in_progress', startedAt: Date.now(),
       steps: profile.sequence.map(key => ({ key, status: 'pending' })), output: '' };
@@ -134,7 +135,7 @@ export class CommandRuns {
     return run;
   }
   stop(id) { const entry = this.active.get(id); if (!entry) throw new Error('Команда уже завершилась.'); entry.stop(); }
-  async close() { const entries = [...this.active.values()]; for (const entry of entries) entry.stop(); await Promise.all(entries.map(entry => entry.done)); }
+  async close() { this.batches.clear(); const entries = [...this.active.values()]; for (const entry of entries) entry.stop(); await Promise.all(entries.map(entry => entry.done)); }
   recordAgent(turn, tool) {
     if (!tool.command || tool.decision && !tool.status) return;
     const id = 'agent:' + turn.message.id + ':' + tool.id;

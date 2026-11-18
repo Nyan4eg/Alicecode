@@ -57,6 +57,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS project_profiles (projectId TEXT PRIMARY KEY REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS command_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS command_sequence_profile ON command_runs
+        (json_extract(data,'$.chatId'), json_extract(data,'$.root'), json_extract(data,'$.profile.id'))
+        WHERE json_extract(data,'$.source')='sequence';
       CREATE TABLE IF NOT EXISTS package_profiles (projectId TEXT NOT NULL REFERENCES projects(id), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(projectId,id));
       CREATE TABLE IF NOT EXISTS check_files (version TEXT PRIMARY KEY, files TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_workspaces (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, chatId TEXT, data TEXT NOT NULL);
@@ -189,6 +192,12 @@ export class Store {
     this.db.prepare('INSERT INTO project_profiles VALUES (?,?) ON CONFLICT(projectId) DO UPDATE SET data=excluded.data').run(projectId, JSON.stringify(profile));
   }
   command(id) { const row = this.db.prepare('SELECT data FROM command_runs WHERE id=?').get(id); return row ? JSON.parse(row.data) : null; }
+  latestSequence(chatId, root, profileId) {
+    const row = this.db.prepare(`SELECT data FROM command_runs WHERE json_extract(data,'$.source')='sequence'
+      AND json_extract(data,'$.chatId')=? AND json_extract(data,'$.root')=? AND json_extract(data,'$.profile.id')=?
+      ORDER BY rowid DESC LIMIT 1`).get(chatId, root, profileId);
+    return row && JSON.parse(row.data);
+  }
   commands() { return this.db.prepare('SELECT data FROM command_runs ORDER BY rowid DESC LIMIT 500').all().map(row => JSON.parse(row.data)); }
   saveCommand(run) { this.db.prepare('INSERT INTO command_runs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(run.id, JSON.stringify(run)); }
   taskWorkspaces() { return this.db.prepare('SELECT * FROM task_workspaces ORDER BY rowid DESC').all().map(({ data, ...row }) => ({ ...row, ...JSON.parse(data) })); }

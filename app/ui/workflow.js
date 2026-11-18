@@ -44,7 +44,10 @@ function renderWorkflow() {
   setText('drawer-caption', chat?.workspace ? chat.workspace.branch : 'Исходная папка');
   if (workflowMode === 'task') {
     const host = $('task-overview'); host.replaceChildren();
-    if (chat) host.append(profileControls(chat,false));
+    if (chat) {
+      if (typeof renderAffectedChecks === 'function') renderAffectedChecks(host, chat);
+      host.append(profileControls(chat,false));
+    }
     const latest = runs.find(run => run.steps && run.profile?.id === chat?.profileId);
     if (latest) {
       const steps = element('div','profile-controls');

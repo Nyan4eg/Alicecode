@@ -15,6 +15,7 @@ import { projectInstructions, profileInstructions, saveInstructions, instruction
 import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
 import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
 import { CommandRuns, commandProfile, commandEnvironment, commandDirectory, commandsPrompt } from './project-commands.mjs';
+import { AffectedChecks } from './affected-checks.mjs';
 import { createUpdates } from './updates.mjs';
 import { describePermission, mergeToolUpdate, nodeTestCounts } from './activity.mjs';
 import { contextPrompt, previewContext, resolveContext } from './context.mjs';
@@ -403,7 +404,7 @@ async function completeTurn(turn, baseline) {
   }
 }
 
-async function send(chatId, input, refs = [], externalIds = [], resume = null, reviewNotes = []) {
+async function send(chatId, input, refs = [], externalIds = [], resume = null, reviewNotes = [], repairProfile = null) {
   assertIdle();
   if (!credentials) throw new Error('Настройте подключение к Yandex.');
   const text = typeof input === 'string' ? input.trim() : '';
@@ -419,7 +420,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null, r
   if (!model) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
-  const profile = commandProfile(resume?.profile ?? store.selectedProfile(chat));
+  const profile = commandProfile(resume?.profile ?? repairProfile ?? store.selectedProfile(chat));
   const instructionSnapshot = resume?.instructions ?? await profileInstructions(chat.cwd,profile);
   const commandEnv = chat.mode === 'code' ? await commandEnvironment(profile) : null;
   assertIdle();
@@ -432,7 +433,7 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null, r
     role: 'assistant', text: '', tools: [], status: 'running',
   };
   const savedWorkspace = store.workspaceStates('chat')[chatId];
-  if (savedWorkspace && !reviewNotes.length) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
+  if (savedWorkspace && !reviewNotes.length && !repairProfile) store.saveWorkspace('chat', chatId, { ...savedWorkspace, draft: '', context: [] });
   const turn = { chatId, mode: chat.mode, approval: chat.approval, abort: new AbortController(), cwd: chat.cwd, message, tools: new Map(), permissions: [], sessionId: null, stage: 'prepare',
     approvedEdits: new Map(), fileReads: new Map(), checkVersions: new Map(), attachments: store.externalAttachments(chatId) };
   active = turn;
@@ -679,6 +680,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     store = new Store(join(app.getPath('userData'), 'alicecode.sqlite'));
     commands = new CommandRuns(store, run => emit('command:run', run));
+    const affected = new AffectedChecks(store, commands);
     attachments = await Attachments.open(join(app.getPath('userData'), 'context-files'));
     attachments.drafts = new Map(store.draftFiles().map(([id, files]) => [id, new Map(files.map(file => [file.id, file]))]));
     attachments.persistDraft = (id, files) => store.saveDraftFiles(id, files);
@@ -764,11 +766,12 @@ if (!app.requestSingleInstanceLock()) {
       return workspace;
     };
     const assertWorkspaceStopped = workspace => {
-      if (active?.cwd === workspace.root || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) throw new Error('Сначала остановите задачу и команды в этой рабочей папке.');
+      if (active?.cwd === workspace.root || commands.batches.has(workspace.chatId) || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) throw new Error('Сначала остановите задачу и команды в этой рабочей папке.');
       if (store.workspaceStates('editor')[workspace.id]?.files?.some(file => file.dirty)) throw new Error('В редакторе задачи есть несохранённые файлы. Сохраните их перед очисткой.');
     };
     bind('project:commands', (id, value) => {
       const chat = taskChat(id); if (active?.chatId === id) throw new Error('Завершите задачу перед изменением команд.');
+      if ([...commands.batches.keys()].some(chatId => store.chat(chatId).projectId === chat.projectId)) throw Error('Дождитесь завершения проверки пакетов.');
       store.putProfile(chat, commandProfile(value)); return snapshot();
     });
     bind('command:profile', (id, profileId) => {
@@ -779,6 +782,27 @@ if (!app.requestSingleInstanceLock()) {
       const chat = taskChat(id);
       const details = { chatId: id, projectId: chat.projectId, root: original ? chat.projectCwd : chat.cwd, profile: store.selectedProfile(chat), key };
       return key === 'sequence' ? commands.sequence(details) : commands.start(details);
+    });
+    bind('checks:affected', id => {
+      const chat = store.chat(id);
+      watchAnalysis(chat.cwd);
+      return affected.summary(chat);
+    });
+    bind('checks:run-affected', (id, ids) => affected.run(taskChat(id), ids));
+    bind('checks:repair', async (id, failedId) => {
+      assertIdle();
+      const chat = taskChat(id), run = store.command(failedId);
+      if (chat.mode !== 'code') throw Error('Выберите режим «Изменить код».');
+      if (!run || run.chatId !== id || run.root !== chat.cwd || run.status !== 'failed') throw Error('Выберите ошибку в рабочей папке чата.');
+      const { rows } = await affected.summary(chat, run.profile.id);
+      const row = rows.find(item => item.failure === failedId && item.status === 'failed');
+      if (!row || commands.batches.has(id)) throw Error('Повторите проверку на текущем коде.');
+      const profile = store.profiles(chat.projectId).map(commandProfile).find(item => item.id === row.id);
+      const config = await profileConfig(chat.cwd, profile);
+      const prompt = ['Исправь ошибку проверки в пакете «' + profile.name + '». Соблюдай правила пакета. Ограничь исправление его исходниками, сохрани поведение соседних пакетов.',
+        'Рабочая папка: ' + run.cwd, 'Конфигурация: ' + (config || 'по умолчанию'), 'Команда: ' + run.command,
+        'Первая ошибка: ' + row.problem.text, 'Вывод проверки:\n' + run.output.slice(-12000)].join('\n');
+      return send(id, prompt, [], [], null, [], profile);
     });
     bind('command:stop', id => {
       const run = store.command(id); if (!run) throw new Error('Команда не найдена.');
@@ -798,7 +822,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('workspace:list', async () => Promise.all(store.taskWorkspaces().map(async workspace => {
       try {
         const details = await taskWorkspaceDetails(workspace, workspaceHome);
-        if (active?.cwd === workspace.root || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) return { ...details, removable: false, note: 'В этой папке выполняется задача или команда.' };
+        if (active?.cwd === workspace.root || commands.batches.has(workspace.chatId) || [...commands.active.values()].some(entry => entry.run.root === workspace.root)) return { ...details, removable: false, note: 'В этой папке выполняется задача или команда.' };
         return details;
       } catch (error) { return { ...workspace, removable: false, note: error.message }; }
     })));
@@ -995,7 +1019,7 @@ if (!app.requestSingleInstanceLock()) {
       return snapshot();
     });
     bind('chat:delete', async id => {
-      if (active?.chatId === id || workspaceMutation || [...commands.active.values()].some(entry => entry.run.chatId === id)) throw new Error('Завершите текущую операцию и команды перед удалением.');
+      if (active?.chatId === id || workspaceMutation || commands.batches.has(id) || [...commands.active.values()].some(entry => entry.run.chatId === id)) throw new Error('Завершите текущую операцию и команды перед удалением.');
       store.deleteChat(id);
       await Promise.all([removeLocalSessions(), attachments.removeChat(id)]);
       return snapshot();
@@ -1017,7 +1041,7 @@ if (!app.requestSingleInstanceLock()) {
     bind('settings:layout', value => store.set('layout', JSON.stringify(normalizeLayout(value))));
     bind('settings:models', refreshModels);
     bind('settings:check-provider', checkConnection);
-    bind('chat:send', send);
+    bind('chat:send', (id, text, refs, external) => send(id, text, refs, external));
     bind('chat:stop', stop);
     bind('chat:permission', (id, allow) => resolvePermission(id, allow === true));
     bind('chat:replay-details', async (chatId, messageId, toolId) => {
@@ -1049,7 +1073,7 @@ app.on('window-all-closed', () => app.quit());
 let stoppingCommands = false;
 app.on('before-quit', event => {
   compression?.abort();
-  if (commands?.active.size && !stoppingCommands) {
+  if ((commands?.active.size || commands?.batches.size) && !stoppingCommands) {
     event.preventDefault(); stoppingCommands = true;
     void commands.close().finally(() => app.quit());
     return;

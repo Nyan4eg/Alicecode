@@ -468,6 +468,13 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 .profile-controls, #profile-sequence { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
 .profile-controls select { min-width:0; max-width:100%; }
 .task-overview > .profile-controls { grid-column:1/-1; }
+.affected-checks { grid-column: 1/-1; display: grid; align-content: start; gap: 5px; min-width: 0; font-size: 12px; }
+.affected-heading, .affected-row { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; }
+.affected-heading { justify-content: space-between; }
+.affected-row .check-label { margin: 0; }
+.affected-reason, .affected-error { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.affected-error { color: #a42e49; }
+.affected-checks summary { cursor: pointer; }
 #commands-dialog { max-height:88vh; overflow:auto; }
 #composer-profile { min-width:0; max-width:min(190px,46%); text-overflow:ellipsis; }
 #composer-context { padding:2px 4px; }

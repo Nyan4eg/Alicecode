@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { Store } from '../app/store.mjs';
 import { CommandRuns, commandProfile, commandDirectory } from '../app/project-commands.mjs';
 import { fileRevision } from '../app/revision.mjs';
+import { AffectedChecks } from '../app/affected-checks.mjs';
 import { execFileSync } from 'node:child_process';
 
 test('package profiles migrate lazily, persist per chat and hash only their Git-visible inputs', async t => {
@@ -34,6 +35,42 @@ test('package profiles migrate lazily, persist per chat and hash only their Git-
 });
 
 async function until(check) { for (let i = 0; i < 200; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 30)); } throw new Error('Timeout'); }
+
+test('shared checks continue after API failure, reuse Web and invalidate only the CSS consumer', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'alicecode-impact-')));
+  const store = new Store(':memory:'), commands = new CommandRuns(store, () => {});
+  t.after(async () => { await commands.close(); store.db.close(); await rm(root,{recursive:true,force:true}); });
+  execFileSync('git',['init','-q'],{cwd:root});
+  for (const dir of ['web','api','shared']) await mkdir(join(root,dir));
+  const chat = store.addProject('Packages',root);
+  const checks = new AffectedChecks(store, commands);
+  const ids = ['api','web'];
+  for (const id of ids) {
+    await writeFile(join(root,id,'check.cjs'),id === 'api' ? 'console.log("entry.ts(3,8): error TS2322: missing price");process.exit(1)' : '');
+    store.putProfile(chat, commandProfile({id, name:id,directory:id,scope:[id,'shared'],commands:{types:'node check.cjs'}}));
+  }
+  execFileSync('git',['add','.'],{cwd:root});
+  execFileSync('git',['-c','user.name=QA','-c','user.email=qa@example.org','commit','-qm','baseline'],{cwd:root});
+  await writeFile(join(root,'shared','types.ts'),'export type Price = number');
+  await writeFile(join(root,'notes.md'),'note');
+  const current = store.chat(chat.id);
+  const summary = () => checks.summary(current);
+  const first = await summary();
+  assert.deepEqual(first.uncovered,['notes.md']);
+  assert.deepEqual(first.rows.map(row => row.reasons),[['shared/types.ts'],['shared/types.ts']]);
+  await checks.run(current,ids);
+  const failed = (await summary()).rows;
+  assert.deepEqual(failed.map(row => row.status),['failed','completed']);
+  assert.equal(failed[0].problem.path,'api/entry.ts'); assert.equal(failed[0].problem.line,3);
+  await writeFile(join(root,'api','check.cjs'),'');
+  await checks.run(current,ids);
+  const passed = (await summary()).rows;
+  assert.deepEqual(passed.map(row => row.status),['completed','completed']);
+  assert.equal(passed[1].runId,failed[1].runId);
+  await writeFile(join(root,'web','style.css'),'body{}');
+  assert.deepEqual((await summary()).rows.map(row => row.status),['completed','stale']);
+  assert.equal(store.chat(chat.id).profileId,'web');
+});
 const quote = text => "'" + text.replaceAll("'", "''") + "'";
 const commandFor = file => (process.platform === 'win32' ? '& ' : '') + quote(process.execPath) + ' ' + quote(file);
 
