@@ -81,6 +81,7 @@ function watchAnalysis(root) {
   if (analysisWatchers.has(root)) return;
   try {
     const watcher = watch(root, { recursive: true }, (_event, file) => {
+      if (file && /(^|[\\/])node_modules$/i.test(file)) emit('checks:changed',root);
       if (file && file.split(/[\\/]/).some(part => ['node_modules', '.git', '.venv'].includes(part))) return;
       emit('checks:changed', root);
       if (!file || file.replaceAll('\\','/').toLowerCase().startsWith('.alicecode')) emit('profiles:changed',root);
@@ -813,12 +814,22 @@ if (!app.requestSingleInstanceLock()) {
     bind('command:start', async (id, key, original = false) => {
       const chat = taskChat(id);
       const details = { chatId: id, projectId: chat.projectId, root: original ? chat.projectCwd : chat.cwd, profile: store.selectedProfile(chat), key };
+      if (key === 'prepare') {
+        if ([...commands.batches.values()].some(batch=>batch.root === details.root)) throw Error('Дождитесь завершения проверки пакетов.');
+        return (await affected.preparation.start(chat,details.root,[],true)).run;
+      }
       return key === 'sequence' ? commands.sequence(details) : commands.start(details);
     });
-    bind('checks:affected', id => {
+    bind('checks:affected', async (id, includeOriginal = false) => {
       const chat = store.chat(id);
       watchAnalysis(chat.cwd);
-      return affected.summary(chat);
+      const summary = await affected.summary(chat);
+      if (includeOriginal && chat.workspace && chat.cwd !== chat.projectCwd) {
+        watchAnalysis(chat.projectCwd);
+        try { summary.originalEnvironment = await affected.preparation.inspect(chat,chat.projectCwd); }
+        catch (error) { summary.originalEnvironment = {root:chat.projectCwd,cwd:chat.projectCwd,reason:error.message}; }
+      }
+      return summary;
     });
     bind('checks:run-affected', (id, ids) => affected.run(taskChat(id), ids));
     bind('checks:repair', async (id, failedId) => {
@@ -847,6 +858,11 @@ if (!app.requestSingleInstanceLock()) {
       const run = store.command(id); if (!run || ['pending', 'in_progress', 'background'].includes(run.status)) throw new Error('Команда ещё выполняется.');
       const chat = taskChat(run.chatId);
       const root = await realpath(run.root);
+      if (run.source === 'preparation') {
+        if (root !== chat.cwd && root !== chat.projectCwd) throw Error('Рабочая папка изменилась.');
+        if ([...commands.batches.values()].some(batch=>batch.root === root)) throw Error('Дождитесь завершения проверки пакетов.');
+        return (await affected.preparation.start(chat,root,run.preparation.profiles,true)).run;
+      }
       if (run.steps) return commands.sequence({ chatId: chat.id, projectId: chat.projectId, root, profile: run.profile });
       const cwd = relative(root, await realpath(run.cwd)).replaceAll('\\', '/');
       return commands.start({ chatId: chat.id, projectId: chat.projectId, root, cwd: cwd || '.', command: run.command, key: run.check, profile: run.profile ?? store.profile(chat.projectId) });

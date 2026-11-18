@@ -3,14 +3,15 @@ const affectedPanel = element('section', 'affected-checks');
 affectedPanel.setAttribute('aria-label', 'Проверки пакетов');
 let affectedKey, affectedChat, affectedData, affectedTimer, affectedRequest = 0;
 let manualProfiles = new Map();
+let expandedEnvironmentRoot;
 const checkingChats = new Set();
 const checkLabels = { missing: 'Ещё не проверен', completed: 'Успешно', failed: 'Ошибка', stale: 'Нужно повторить',
-  interrupted: 'Прервано', in_progress: 'Выполняется', unknown: 'Версия не подтверждена' };
+  interrupted: 'Прервано', in_progress: 'Выполняется', skipped: 'Проверка не запускалась', unknown: 'Версия не подтверждена' };
 
 function renderAffectedChecks(host, chat) {
   host.append(affectedPanel);
   const profiles = state.profileSets[chat.projectId];
-  const key = JSON.stringify([chat.id, currentRoot(), profiles]);
+  const key = JSON.stringify([chat.id, currentRoot(), chat.profileId, profiles]);
   if (affectedKey !== key) {
     affectedKey = key; affectedChat = chat.id; affectedData = null; manualProfiles = new Map();
     affectedPanel.textContent = 'Определяем затронутые пакеты…';
@@ -25,7 +26,7 @@ function scheduleChecks(delay = 150) {
   const id = state.activeChat;
   affectedTimer = setTimeout(async () => {
     try {
-      const data = await api.affectedChecks(id);
+      const data = await api.affectedChecks(id, expandedEnvironmentRoot === currentRoot());
       if (request !== affectedRequest || state.activeChat !== id) return;
       affectedData = data; drawChecks();
     } catch (error) {
@@ -39,19 +40,42 @@ function scheduleChecks(delay = 150) {
 function drawChecks() {
   const chat = activeChat();
   if (!chat || chat.id !== affectedChat || !affectedData) return;
-  const { rows, uncovered, git } = affectedData;
-  const busy = checkingChats.has(chat.id) || state.commandRuns.some(run => run.chatId === chat.id && run.steps && runIsActive(run));
-  const selected = row => row.configured && (manualProfiles.get(row.id) ?? Boolean(row.reasons.length));
+  const { rows, uncovered, git, environment } = affectedData;
+  const busy = checkingChats.has(chat.id) || environment.status === 'running' || state.commandRuns.some(run => run.chatId === chat.id && run.steps && runIsActive(run));
+  const selected = row => row.configured && (manualProfiles.get(row.id) ?? Boolean(row.reasons.length || row.status === 'skipped'));
   const pending = rows.filter(row => selected(row) && row.status !== 'completed');
-  const launch = workflowButton(busy ? 'Проверяем…' : 'Проверить затронутые' + (pending.length ? ' · ' + pending.length : ''), async () => {
+  const needsSetup = Boolean(environment.inputs.command) && environment.status !== 'ready';
+  const action = needsSetup ? (environment.status === 'failed' ? 'Повторить подготовку и проверить' : 'Подготовить и проверить') : 'Проверить затронутые';
+  const launch = workflowButton(busy ? 'Проверяем…' : action + (pending.length ? ' · ' + pending.length : ''), async () => {
     checkingChats.add(chat.id); drawChecks();
     try { await api.runAffected(chat.id, rows.filter(selected).map(row => row.id)); }
     catch (error) { toast(error); }
     finally { checkingChats.delete(chat.id); scheduleChecks(0); }
   });
-  launch.id = 'run-affected'; launch.disabled = busy || !pending.length || Boolean(chat.archivedAt);
+  launch.id = 'run-affected'; launch.disabled = busy || environment.status === 'blocked' || !(needsSetup ? rows.some(selected) : pending.length) || Boolean(chat.archivedAt);
   const head = element('div','affected-heading'); head.append(element('strong','','Проверки пакетов'),launch);
   affectedPanel.replaceChildren(head);
+  const info = element('details','environment-info');
+  info.id = 'check-environment'; info.dataset.status = environment.status;
+  info.open = expandedEnvironmentRoot === environment.root;
+  info.addEventListener('toggle', () => {
+    if (!info.isConnected || info.open === (expandedEnvironmentRoot === environment.root)) return;
+    expandedEnvironmentRoot = info.open ? environment.root : undefined;
+    if (info.open && chat.workspace) scheduleChecks(0);
+  });
+  info.append(element('summary','',(chat.workspace ? 'Ветка задачи' : 'Исходная папка') + ' · ' + environment.reason));
+  info.append(element('small','muted',environment.cwd),element('small','muted',
+    'Node.js ' + (environment.inputs.node ?? '—') + ' · npm ' + (environment.inputs.npm ?? '—') +
+    ' · ' + (environment.lock ?? 'Нет lock-файла npm')));
+  if (environment.inputs.command) info.append(element('code','',environment.inputs.command));
+  if (affectedData.originalEnvironment) {
+    const original = affectedData.originalEnvironment;
+    info.append(element('small','muted','Исходная папка · ' + original.reason + ' · ' + original.cwd));
+  }
+  if (environment.runId && environment.chatId === chat.id) info.append(workflowButton('Журнал подготовки', () => {
+    selectedCommandId = environment.runId; openWorkflow('commands');
+  }));
+  affectedPanel.append(info);
   if (!git) affectedPanel.append(element('small','muted','Чтобы проверить папку вне Git, выберите профили вручную.'));
   if (uncovered.length) affectedPanel.append(element('small','error','Без настроенной проверки · ' + uncovered.join(', ')));
   const manual = element('details');
@@ -95,7 +119,9 @@ function drawChecks() {
   if (manual.children.length > 1) affectedPanel.append(manual);
   if (!rows.length) affectedPanel.append(element('small','muted','Настройте шаги проверки в профиле команд.'));
 }
-api.onChecksChanged(root => { if (state && root === currentRoot()) scheduleChecks(); });
-api.onCommand(run => { if (run.chatId === state?.activeChat && run.steps) scheduleChecks(); });
+api.onChecksChanged(root => {
+  if (state && (root === currentRoot() || root === affectedData?.originalEnvironment?.root)) scheduleChecks();
+});
+api.onCommand(run => { if (run.chatId === state?.activeChat && run.steps || run.preparation && state && run.root === currentRoot()) scheduleChecks(); });
 window.addEventListener('focus', () => { if (state) scheduleChecks(); });
 if (state) renderWorkflow();

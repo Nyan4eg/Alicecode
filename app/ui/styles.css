@@ -475,6 +475,8 @@ input { width: 100%; border-radius: 8px; border: 1px solid #dcd4e7; padding: 8px
 .affected-reason, .affected-error { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .affected-error { color: #a42e49; }
 .affected-checks summary { cursor: pointer; }
+.environment-info { padding: 4px 0; }
+.environment-info small, .environment-info code { display: block; margin: 3px 0; overflow-wrap: anywhere; }
 #repo-profiles-dialog { width: min(680px,90vw); }
 #repo-profiles-list { display: grid; gap: 8px; overflow: auto; max-height: 54vh; }
 .repo-profile { display: grid; gap: 4px; padding: 9px; border: 1px solid #e1daec; border-radius: 8px; }

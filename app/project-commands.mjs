@@ -1,6 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { stat } from 'node:fs/promises';
-import { dirname, isAbsolute, delimiter, relative, resolve } from 'node:path';
+import { statSync } from 'node:fs';
+import { dirname, isAbsolute, delimiter, relative, resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { stripVTControlCharacters } from 'node:util';
 import { projectEntry } from './workspace.mjs';
@@ -51,6 +52,7 @@ export function commandsPrompt(profile, root) {
 export class CommandRuns {
   active = new Map();
   batches = new Map();
+  preparing = new Set();
   constructor(store, publish) { this.store = store; this.publish = publish; }
   save(run) { this.store.saveCommand(run); this.publish(run); }
   async fingerprint(root, profile) {
@@ -61,12 +63,13 @@ export class CommandRuns {
     return revision.version;
   }
   async sequence(details) {
+    if (this.preparing.has(details.root)) throw Error('Дождитесь завершения подготовки среды.');
     const profile = commandProfile(details.profile);
     if (!profile.sequence.length) throw Error('Настройте шаги проверки в командах проекта.');
     if (this.batches.get(details.chatId) !== details.batch || [...this.active.values()].some(({ run }) => run.steps && run.chatId === details.chatId)) throw Error('Проверка уже выполняется.');
     const run = { id: randomUUID(), chatId: details.chatId, projectId: details.projectId, root: details.root,
       cwd: details.root, profile, command: 'Проверить задачу', source: 'sequence', status: 'in_progress', startedAt: Date.now(),
-      steps: profile.sequence.map(key => ({ key, status: 'pending' })), output: '' };
+      preparedRunId: details.preparedRunId, steps: profile.sequence.map(key => ({ key, status: 'pending' })), output: '' };
     let stopped = false, childId, currentStep;
     const stop = () => { stopped = true; this.active.get(childId)?.stop(); };
     const execute = async () => {
@@ -101,12 +104,15 @@ export class CommandRuns {
     if (typeof command !== 'string' || !command.trim() || command.length > 3000 || command.includes('\0')) throw new Error('Сначала настройте команду проекта.');
     const cwd = await commandDirectory(details.root, details.cwd ? { ...profile, directory: details.cwd } : profile);
     const env = await commandEnvironment(profile);
+    if (this.closing) throw Error('Приложение завершает работу.');
     const windows = process.platform === 'win32';
     const run = { id: randomUUID(), chatId: details.chatId, projectId: details.projectId, root: details.root, cwd,
       command, profile, label: commandLabels[details.key] ?? 'Повтор команды', source: 'project', status: 'in_progress',
       startedAt: Date.now(), elapsedMs: 0, output: '', exitCode: null };
     run.check = checkKind(command, profile, details.key);
+    if (details.preparation) { run.source = 'preparation'; run.preparation = details.preparation; run.check = null; }
     if (run.check) run.version = await this.fingerprint(details.root, profile);
+    if (!details.preparation && this.preparing.has(details.root)) throw Error('Дождитесь завершения подготовки среды.');
     const child = spawn(windows ? 'powershell.exe' : '/bin/sh', windows
       ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', "$ErrorActionPreference = 'Stop'\n[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n$global:LASTEXITCODE = 0\n" + command + '\nexit $LASTEXITCODE'] : ['-c', command],
     { cwd, env, windowsHide: true, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -133,12 +139,19 @@ export class CommandRuns {
     child.once('close', (code, signal) => {
       run.exitCode = code; run.status = stopping || signal ? 'interrupted' : code === 0 ? 'completed' : 'failed';
       run.error = failure; run.endedAt = Date.now(); run.tests = nodeTestCounts(run.output);
+      if (run.preparation && run.status === 'completed') {
+        try { run.preparation.hadModules = Boolean(statSync(join(run.root,run.preparation.modulesDirectory),{throwIfNoEntry:false})?.isDirectory()); }
+        catch { run.preparation.hadModules = false; }
+        if (run.preparation.requiresModules && !run.preparation.hadModules) {
+          run.status = 'failed'; run.error = 'После подготовки отсутствует node_modules.'; run.output += '\n' + run.error;
+        }
+      }
       this.active.delete(run.id); publish(); finished(run);
     });
     return run;
   }
   stop(id) { const entry = this.active.get(id); if (!entry) throw new Error('Команда уже завершилась.'); entry.stop(); }
-  async close() { this.batches.clear(); const entries = [...this.active.values()]; for (const entry of entries) entry.stop(); await Promise.all(entries.map(entry => entry.done)); }
+  async close() { this.closing = true; this.batches.clear(); const entries = [...this.active.values()]; for (const entry of entries) entry.stop(); await Promise.all(entries.map(entry => entry.done)); }
   recordAgent(turn, tool) {
     if (!tool.command || tool.decision && !tool.status) return;
     const id = 'agent:' + turn.message.id + ':' + tool.id;

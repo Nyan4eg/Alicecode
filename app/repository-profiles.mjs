@@ -51,7 +51,7 @@ export async function saveRepositoryProfiles(store, chat, token) {
   await writeChecked(chat.projectCwd,file,content);
 }
 
-function workspaceMatch(dir, patterns) {
+export function workspaceMatch(dir, patterns) {
   let included = false;
   for (const raw of patterns) {
     if (typeof raw !== 'string') throw Error('Проверьте список workspaces в package.json.');

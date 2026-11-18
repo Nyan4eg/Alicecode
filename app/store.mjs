@@ -57,6 +57,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS draft_files (chatId TEXT PRIMARY KEY REFERENCES chats(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS project_profiles (projectId TEXT PRIMARY KEY REFERENCES projects(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS command_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS preparation_root ON command_runs
+        (json_extract(data,'$.projectId'),json_extract(data,'$.root')) WHERE json_extract(data,'$.source')='preparation';
       CREATE INDEX IF NOT EXISTS command_sequence_profile ON command_runs
         (json_extract(data,'$.chatId'), json_extract(data,'$.root'), json_extract(data,'$.profile.id'))
         WHERE json_extract(data,'$.source')='sequence';
@@ -210,6 +212,11 @@ export class Store {
     this.db.prepare('INSERT INTO project_profiles VALUES (?,?) ON CONFLICT(projectId) DO UPDATE SET data=excluded.data').run(projectId, JSON.stringify(profile));
   }
   command(id) { const row = this.db.prepare('SELECT data FROM command_runs WHERE id=?').get(id); return row ? JSON.parse(row.data) : null; }
+  latestPreparation(projectId,root) {
+    const row = this.db.prepare(`SELECT data FROM command_runs WHERE json_extract(data,'$.source')='preparation'
+      AND json_extract(data,'$.projectId')=? AND json_extract(data,'$.root')=? ORDER BY rowid DESC LIMIT 1`).get(projectId,root);
+    return row && JSON.parse(row.data);
+  }
   latestSequence(chatId, root, profileId) {
     const row = this.db.prepare(`SELECT data FROM command_runs WHERE json_extract(data,'$.source')='sequence'
       AND json_extract(data,'$.chatId')=? AND json_extract(data,'$.root')=? AND json_extract(data,'$.profile.id')=?

@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import { projectPath } from './activity.mjs';
 import { commandProfile } from './project-commands.mjs';
 import { fileRevision } from './revision.mjs';
+import { Preparation } from './preparation.mjs';
 import { gitIn, gitPrefix, listChanges } from './workspace.mjs';
 
 function checkSettings(profile) {
@@ -32,9 +33,10 @@ async function changedPaths(chat) {
 }
 
 export class AffectedChecks {
-  constructor(store, commands) { this.store = store; this.commands = commands; }
+  constructor(store, commands) { this.store = store; this.commands = commands; this.preparation = new Preparation(store,commands); }
 
-  async summary(chat, onlyProfile) {
+  async summary(chat, onlyProfile, environment) {
+    environment ??= await this.preparation.inspect(chat);
     const paths = onlyProfile ? [] : await changedPaths(chat);
     const uncovered = new Set(paths);
     const rows = [];
@@ -59,10 +61,13 @@ export class AffectedChecks {
           else if (steps.some(step => step.version !== version)) status = 'stale';
         } else if (status === 'completed') status = 'unknown';
       }
+      if (environment.status === 'failed' && environment.chatId === chat.id && environment.skipped.includes(profile.id)) status = 'skipped';
+      else if (environment.runId && environment.status !== 'unconfigured' && ['completed','failed'].includes(status) &&
+        (environment.status !== 'ready' || (run.preparedRunId ? run.preparedRunId !== environment.runId : run.startedAt < environment.endedAt))) status = 'stale';
       rows.push({ id: profile.id, name: profile.name, configured: Boolean(profile.sequence.length),
         reasons, links: profile.links, status, runId: run?.id, failure, problem });
     }
-    return { rows, uncovered: [...uncovered], git: paths !== null };
+    return { rows, uncovered: [...uncovered], git: paths !== null, environment };
   }
 
   async run(chat, ids) {
@@ -71,16 +76,26 @@ export class AffectedChecks {
     const selected = [...new Set(ids)].map(id => profiles.find(p => p.id === id));
     if (selected.some(p => !p?.sequence.length)) throw Error('Проверьте настройки выбранных профилей.');
     const batch = this.commands.batches;
-    if (batch.has(chat.id)) throw Error('Проверки уже выполняются.');
-    const token = {};
+    if (batch.has(chat.id) || [...batch.values()].some(item => item.root === chat.cwd)) throw Error('Проверки уже выполняются.');
+    const token = {root:chat.cwd};
     batch.set(chat.id, token);
     try {
+      let environment = await this.preparation.inspect(chat);
+      if (environment.status === 'blocked') throw Error(environment.reason);
+      if (environment.inputs.command && environment.status !== 'ready') {
+        if (batch.get(chat.id) !== token) return;
+        const preparation = await this.preparation.start(chat,chat.cwd,ids);
+        const finished = await preparation.done;
+        if (finished && finished.status !== 'completed') return;
+        environment = await this.preparation.inspect(chat);
+        if (environment.status !== 'ready') throw Error(environment.reason);
+      }
       for (const profile of selected) {
         if (batch.get(chat.id) !== token) break;
-        const { rows } = await this.summary(chat, profile.id);
+        const { rows } = await this.summary(chat, profile.id,environment);
         if (rows[0]?.status === 'completed') continue;
         if (batch.get(chat.id) !== token) break;
-        const run = await this.commands.sequence({ chatId: chat.id, projectId: chat.projectId, root: chat.cwd, profile, batch: token });
+        const run = await this.commands.sequence({ chatId: chat.id, projectId: chat.projectId, root: chat.cwd, profile, batch: token,preparedRunId:environment.status === 'ready' ? environment.runId : undefined });
         await this.commands.active.get(run.id)?.done;
         if (run.status === 'interrupted') break;
       }
