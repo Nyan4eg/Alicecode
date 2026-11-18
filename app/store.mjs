@@ -317,6 +317,7 @@ export class Store {
       this.db.prepare('DELETE FROM messages WHERE chatId=?').run(id);
       this.db.prepare('DELETE FROM draft_files WHERE chatId=?').run(id);
       this.db.prepare("DELETE FROM api_requests WHERE json_extract(data,'$.chatId')=?").run(id);
+      this.db.prepare("DELETE FROM project_analysis WHERE json_extract(data,'$.chatId')=?").run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='chat' AND id=?").run(id);
       this.db.prepare("DELETE FROM workspace_states WHERE scope='editor' AND id=?").run(id);
       this.db.prepare('DELETE FROM chats WHERE id=?').run(id);

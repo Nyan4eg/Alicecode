@@ -6,6 +6,7 @@ const subscribe = (name) => (fn) => ipcRenderer.on(name, (_event, data) => fn(da
 contextBridge.exposeInMainWorld('alicecode', {
   state: invoke('app:state'),
   codeQuery: invoke('code:query'),
+  codeConfig: invoke('code:config'),
   staleAnalysis: invoke('code:stale'),
   onAnalysis: subscribe('analysis:result'),
   onAnalysisStale: subscribe('analysis:stale'),

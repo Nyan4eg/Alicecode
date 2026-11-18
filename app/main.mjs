@@ -11,7 +11,7 @@ import { readPrototypeCredentials, validateCredentials } from './credentials.mjs
 import { createProject, listChanges, listDirectory, readProjectDiff, readProjectFile, searchFiles, searchContent } from './workspace.mjs';
 import { discuss } from './discussion.mjs';
 import { consent } from './permissions.mjs';
-import { projectInstructions, saveInstructions, instructionsPrompt } from './instructions.mjs';
+import { projectInstructions, profileInstructions, saveInstructions, instructionsPrompt } from './instructions.mjs';
 import { generatePlan, validatePlan, finishStep } from './task-plan.mjs';
 import { createTaskWorkspace, transferPreview, applyTransfer, taskWorkspaceDetails, removeTaskWorkspace } from './task-workspace.mjs';
 import { CommandRuns, commandProfile, commandEnvironment, commandDirectory, commandsPrompt } from './project-commands.mjs';
@@ -27,7 +27,7 @@ import { commitPreview, createCommit, gitHunks, stageFile, stageHunks } from './
 import { Attachments } from './attachments.mjs';
 import { createProvider, keyMode, providerError, subscriptionMode, validateSubscription } from './providers.mjs';
 import { monitoredProvider } from './requests.mjs';
-import { codeQuery } from './code-service.mjs';
+import { codeQuery, profileConfig } from './code-service.mjs';
 import { checkKind, codeVersion, fileRevision } from './revision.mjs';
 import { inspectFragments, suggestContext, summarize, summaryPrompt } from './conversation-context.mjs';
 
@@ -70,8 +70,10 @@ function requestObserver(owner = null) {
 function taskProvider(owner = null) { return monitoredProvider(createProvider(credentials), requestObserver(owner)); }
 function staleAnalysis(root) {
   revisions.set(root, (revisions.get(root) ?? 0) + 1);
-  const data = store.analyses()[root];
-  if (data && !data.stale) { store.saveAnalysis(root, { ...data, stale: true }); emit('analysis:stale', root); }
+  for (const [key,data] of Object.entries(store.analyses())) {
+    if (data.root !== root || data.stale) continue;
+    store.saveAnalysis(key, { ...data, stale: true }); emit('analysis:stale', key);
+  }
 }
 function watchAnalysis(root) {
   if (analysisWatchers.has(root)) return;
@@ -417,8 +419,8 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null, r
   if (!model) {
     throw new Error('Выбранная модель отсутствует в каталоге. Выберите другую модель.');
   }
-  const instructionSnapshot = resume?.instructions ?? await projectInstructions(chat.cwd);
   const profile = commandProfile(resume?.profile ?? store.selectedProfile(chat));
+  const instructionSnapshot = resume?.instructions ?? await profileInstructions(chat.cwd,profile);
   const commandEnv = chat.mode === 'code' ? await commandEnvironment(profile) : null;
   assertIdle();
   const task = { root: chat.cwd, workspace: chat.workspace, approval: chat.approval, instructions: instructionSnapshot, profile, summary: chat.summary,
@@ -446,7 +448,10 @@ async function send(chatId, input, refs = [], externalIds = [], resume = null, r
     const referenceCatalog = turn.attachments.length ? 'Справочные вложения этого чата (только чтение, доступны встроенным инструментом чтения):\n'
       + [...new Map(turn.attachments.map(file => [file.id, file])).values()].slice(-32)
         .map(file => JSON.stringify(file.label) + ': ' + JSON.stringify(attachments.path(chatId, file).replaceAll('\\', '/'))).join('\n') : '';
-    const instructionText = instructionsPrompt(instructionSnapshot);
+    const instructionText = 'Текущий профиль задачи: ' + profile.name + ' · ' + (profile.directory || '.') +
+      '\nИспользуй актуальные инструкции этого запуска для указанных папок.\n' + instructionsPrompt(instructionSnapshot)
+      + (chat.mode === 'code' && instructionSnapshot.sources?.some(file => file.text)
+        ? '\nПеред завершением сверь изменённые файлы с применимыми требованиями, включая поведение и соглашения о коде.' : '');
     if (chat.mode === 'discuss') {
       const history = store.db.prepare("SELECT role,text FROM messages WHERE chatId=? AND id>? AND id<? AND text<>'' ORDER BY id DESC LIMIT 24")
         .all(chatId, chat.summary?.through ?? 0, message.id - 1).reverse().map(item => ({ role: item.role, content: item.text.slice(-12000) }));
@@ -680,25 +685,33 @@ if (!app.requestSingleInstanceLock()) {
     await removeLocalSessions();
     try { await importCredentials(); } catch (error) { credentialError = error.message; }
     bind('app:state', snapshot);
+    bind('code:config', id => {
+      const chat = store.chat(id);
+      return profileConfig(chat.cwd,commandProfile(store.selectedProfile(chat)));
+    });
     bind('code:query', async (id, action, input = {}) => {
       if (!['diagnostics', 'definition', 'references', 'symbols'].includes(action)) throw new Error('Неизвестное действие анализа.');
-      const root = selectedPath(id); watchAnalysis(root); const version = revisions.get(root) ?? 0;
-      const result = await codeQuery(root, action, input);
+      const chat = store.chat(id), root = chat.cwd, profile = commandProfile(store.selectedProfile(chat));
+      const key = JSON.stringify([id, root, profile.id, profile.directory, profile.config]);
+      watchAnalysis(root); const version = revisions.get(root) ?? 0;
+      const result = await codeQuery(root, action, input, profile);
       if (action === 'diagnostics') {
-        const data = { ...result, root, checkedAt: Date.now(), stale: (revisions.get(root) ?? 0) !== version, overlays: (input.overlays ?? []).map(file => file.path) };
-        store.saveAnalysis(root, data); emit('analysis:result', data); return data;
+        const data = { ...result, key, chatId:id, root, checkedAt: Date.now(), stale: (revisions.get(root) ?? 0) !== version, overlays: (input.overlays ?? []).map(file => file.path) };
+        store.saveAnalysis(key, data); emit('analysis:result', data); return data;
       }
       return result;
     });
     bind('code:stale', id => staleAnalysis(selectedPath(id)));
     bind('context:details', async (id, refs = [], externalIds = [], file = null, query = '') => {
-      const chat = store.chat(id), instructions = await projectInstructions(chat.cwd);
+      const chat = store.chat(id), profile = commandProfile(store.selectedProfile(chat));
+      const instructions = await profileInstructions(chat.cwd,profile);
+      const config = await profileConfig(chat.cwd,profile).catch(error => error.message);
       const pins = await inspectFragments(chat.cwd, chat.pins);
       const drafts = await inspectFragments(chat.cwd, refs);
       const external = attachments.files(id, externalIds).map(({ text, ...item }) => ({ ...item, chars: text.length }));
-      return { root: chat.cwd, instructions, summary: chat.summary, pins, drafts, external,
+      return { root: chat.cwd, profile, config, instructions, summary: chat.summary, pins, drafts, external,
         references: store.externalAttachments(id).slice(-32), suggestions: await suggestContext(chat.cwd, file, query),
-        chars: instructions.text.length + (chat.summary?.text.length ?? 0) + [...pins, ...drafts.filter(ref => !pins.some(pin => pin.digest === ref.digest))].reduce((sum, item) => sum + (item.chars ?? 0), 0) + external.reduce((sum, item) => sum + item.chars, 0) };
+        chars: instructions.sources.reduce((sum,file) => sum + file.text.length, 0) + (chat.summary?.text.length ?? 0) + [...pins, ...drafts.filter(ref => !pins.some(pin => pin.digest === ref.digest))].reduce((sum, item) => sum + (item.chars ?? 0), 0) + external.reduce((sum, item) => sum + item.chars, 0) };
     });
     bind('context:pin', async (id, ref) => {
       const chat = store.chat(id), [valid] = await resolveContext(chat.cwd, [ref]);
@@ -759,7 +772,8 @@ if (!app.requestSingleInstanceLock()) {
       store.putProfile(chat, commandProfile(value)); return snapshot();
     });
     bind('command:profile', (id, profileId) => {
-      taskChat(id); store.selectProfile(id, profileId); return snapshot();
+      taskChat(id); if (active?.chatId === id || workspaceMutation) throw Error('Дождитесь завершения текущей операции.');
+      store.selectProfile(id, profileId); return snapshot();
     });
     bind('command:start', async (id, key, original = false) => {
       const chat = taskChat(id);
@@ -802,8 +816,16 @@ if (!app.requestSingleInstanceLock()) {
       if (active?.chatId === id) throw new Error('Завершите задачу перед сменой режима.');
       taskChat(id); store.setTaskOptions(id, value); return snapshot();
     });
-    bind('project:instructions', id => projectInstructions(selectedPath(id)));
-    bind('project:save-instructions', (id, text, stamp) => mutateWorkspace(() => saveInstructions(selectedPath(id), text, stamp)));
+    const instructionFile = (id,path = 'AGENTS.md') => {
+      const chat = store.chat(id), profile = commandProfile(store.selectedProfile(chat));
+      const local = join(profile.directory,'AGENTS.md').replaceAll('\\','/');
+      if (path !== 'AGENTS.md' && path !== local) throw Error('Файл инструкций относится к другому профилю.');
+      return {root:chat.cwd,path};
+    };
+    bind('project:instructions', (id,path) => { const file=instructionFile(id,path); return projectInstructions(file.root,file.path); });
+    bind('project:save-instructions', (id,text,stamp,path) => mutateWorkspace(() => {
+      const file=instructionFile(id,path); return saveInstructions(file.root,text,stamp,file.path);
+    }));
     bind('task:plan', (id, input, steps = null) => mutateState(async () => {
       const chat = taskChat(id);
       const text = typeof input === 'string' ? input.trim() : '';
@@ -815,7 +837,7 @@ if (!app.requestSingleInstanceLock()) {
         const model = available.find(m => m.id === chat.modelId);
         if (!model) throw new Error('Выберите доступную модель.');
         const provider = taskProvider({ chatId: id, kind: 'plan' });
-        plan = await generatePlan(provider, provider.model(credentials.folderId, model.id), credentials.folderId, text, await projectInstructions(chat.cwd), new AbortController().signal);
+        plan = await generatePlan(provider, provider.model(credentials.folderId, model.id), credentials.folderId, text, await profileInstructions(chat.cwd,commandProfile(store.selectedProfile(chat))), new AbortController().signal);
       }
       store.setDraftPlan(id, plan);
       store.setTaskOptions(id, { approval: chat.approval, planning: true });

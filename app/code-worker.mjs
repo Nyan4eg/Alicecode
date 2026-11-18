@@ -43,8 +43,7 @@ try {
   }
   const roots = paths.filter(path => sourcePattern.test(path) && !path.split(/[\\/]/).some(part => ['node_modules', '.git', 'dist', 'build'].includes(part)))
     .map(path => resolve(root, path)).filter(file => permitted(file));
-  if (roots.length > 3000) { roots.length = 3000; limited = true; }
-  const configPath = ['tsconfig.json', 'jsconfig.json'].map(path => join(root, path)).find(file => permitted(file));
+  const configPath = workerData.config && join(root,workerData.config);
   let note = '', errors = [], options = { allowJs: true, checkJs: false, noEmit: true, target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, skipLibCheck: true };
   let files = roots.filter(file => /\.[cm]?[jt]sx?$/i.test(file));
@@ -52,11 +51,14 @@ try {
     const config = ts.readConfigFile(configPath, read);
     if (config.error) errors.push(config.error);
     const parsed = ts.parseJsonConfigFileContent(config.config ?? {}, { ...ts.sys, readFile: read,
-      readDirectory: (dir, ...args) => permitted(dir) ? ts.sys.readDirectory(dir, ...args).filter(permitted).slice(0, 3000) : [] }, root);
+      fileExists: file => permitted(file) && ts.sys.fileExists(file),
+      readDirectory: (dir, ...args) => permitted(dir) ? ts.sys.readDirectory(dir, ...args).filter(permitted) : [] }, dirname(configPath), undefined, configPath);
     options = { ...parsed.options, noEmit: true }; errors.push(...parsed.errors);
     if (parsed.projectReferences?.length) { limited = true; note = 'Конфигурация использует project references. Для полного анализа откройте папку соответствующего пакета.'; }
-    files = parsed.fileNames.filter(permitted).map(file => realpathSync(file)).filter(file => files.includes(file)).slice(0, 3000);
-  }
+    const visible = new Set(files.map(file => realpathSync(file)));
+    files = parsed.fileNames.filter(permitted).map(file => realpathSync(file)).filter(file => visible.has(file));
+  } else files = files.filter(file => inside(resolve(root,workerData.directory),file));
+  if (files.length > 3000) { limited = true; files = files.slice(0,3000); }
   if (input.path) {
     const selected = realpathSync(resolve(root, input.path));
     if (!inside(root, selected) || !/\.[cm]?[jt]sx?$/i.test(selected)) throw new Error('Навигация доступна для JS/TS-файлов проекта.');
@@ -80,7 +82,10 @@ try {
   let result;
   if (action === 'diagnostics') {
     const program = service.getProgram();
-    const diagnostics = [...errors, ...service.getCompilerOptionsDiagnostics(), ...files.flatMap(file => [...service.getSyntacticDiagnostics(file), ...service.getSemanticDiagnostics(file)])];
+    const sources = program.getSourceFiles().filter(source => inside(root,source.fileName) && !source.fileName.split(/[\\/]/).includes('node_modules'));
+    if (sources.length > 3000) limited = true;
+    const diagnostics = [...errors, ...service.getCompilerOptionsDiagnostics(), ...sources.slice(0,3000).flatMap(source =>
+      [...program.getSyntacticDiagnostics(source), ...program.getSemanticDiagnostics(source)])];
     const seen = new Set(); const problems = [];
     for (const diagnostic of diagnostics) {
       const place = diagnostic.file ? location(diagnostic.file.fileName, diagnostic.start, diagnostic.length) : {};
@@ -103,5 +108,5 @@ try {
     } else throw new Error('Неизвестное действие анализа.');
   }
   service.dispose();
-  parentPort.postMessage({ ...result, limited, note });
+  parentPort.postMessage({ ...result, config: workerData.config, limited, note });
 } catch (error) { parentPort.postMessage({ error: error.message }); }

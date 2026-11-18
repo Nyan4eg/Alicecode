@@ -2,6 +2,16 @@
 let navigationItems = [], navigationOrigin, navigationRoot, navigationBusy = false;
 const navigationBack = [], selectedProblems = new Set(), openApiRows = new Set();
 let analysisBusy = false, analysisRoot, contextKey = '', contextGeneration = 0, contextCache, summaryTarget, compressing = false, compressionMessage = '', changedCodeTimer;
+function analysisKey() {
+  const chat = activeChat(), p = state.projectProfiles?.[chat?.projectId];
+  return p ? JSON.stringify([chat.id,currentRoot(),p.id,p.directory,p.config]) : '';
+}
+$('composer-profile').addEventListener('change', async event => {
+  const picker = event.target; picker.disabled = true;
+  try { updateState(await api.selectCommandProfile(state.activeChat,picker.value)); }
+  catch (error) { toast(error); renderComposer(); }
+});
+$('composer-context').addEventListener('click', () => openWorkflow('context'));
 function editorOverlays() { return [...(editorGroup()?.values() ?? [])].slice(0, 40).map(file => ({ path: file.path, text: file.text })); }
 async function refreshCleanEditorBuffers() {
   const id = state.activeChat, files = editorGroup();
@@ -19,7 +29,7 @@ async function refreshCleanEditorBuffers() {
 }
 function changedCode() {
   const id = state.activeChat, root = currentRoot();
-  if (state.analyses?.[root]) state.analyses[root].stale = true;
+  for (const data of Object.values(state.analyses ?? {})) if (data.root === root) data.stale = true;
   clearTimeout(changedCodeTimer); changedCodeTimer = setTimeout(() => { changedCodeTimer = null; void api.staleAnalysis(id).catch(() => {}); }, 250);
   if (workflowMode === 'problems') renderProblems();
 }
@@ -34,10 +44,11 @@ async function jumpToCode(item, remember = true) {
 async function navigateCode(action) {
   if (!editView || !/\.[cm]?[jt]sx?$/i.test(editView.path) || navigationBusy) return toast('Откройте JS/TS-файл в редакторе.');
   navigationOrigin = navOrigin(); navigationRoot = currentRoot(); navigationBusy = true;
+  const key = analysisKey();
   try {
     await refreshCleanEditorBuffers();
     const result = await api.codeQuery(state.activeChat, action, { path: editView.path, position: editor.position().selection.head, overlays: editorOverlays() });
-    if (navigationRoot !== currentRoot()) return;
+    if (navigationRoot !== currentRoot() || key !== analysisKey()) return;
     navigationItems = result.items;
     if (action === 'definition' && navigationItems.length === 1) return await jumpToCode(navigationItems[0]);
     setText('code-navigation-title', ({ definition: 'Определения', references: 'Использования', symbols: 'Символы файла' })[action]);
@@ -65,20 +76,33 @@ document.addEventListener('keydown', event => {
 }, true);
 
 function rootProblems() {
-  const root = currentRoot(), analysis = state.analyses?.[root], problems = (analysis?.problems ?? []).map(problem => ({ ...problem, stale: analysis.stale }));
+  const root = currentRoot(), analysis = state.analyses?.[analysisKey()], problems = (analysis?.problems ?? []).map(problem => ({ ...problem, stale: analysis.stale }));
   const latest = new Map();
-  for (const run of (state.commandRuns ?? []).filter(run => run.root === root && !runIsActive(run)).sort((a, b) => b.startedAt - a.startedAt)) if (!latest.has(run.command)) latest.set(run.command, run);
+  for (const run of (state.commandRuns ?? []).filter(run => run.root === root && (run.profile?.id ?? 'all') === activeChat()?.profileId && !runIsActive(run)).sort((a, b) => b.startedAt - a.startedAt)) if (!latest.has(run.command)) latest.set(run.command, run);
   for (const run of latest.values()) if (run.status === 'failed' || run.status === 'interrupted') problems.push({ source: run.source === 'agent' ? 'Команда Алисы' : 'Команда проекта', severity: 'error', runId: run.id,
     code: 'EXIT ' + (run.exitCode ?? '—'), message: run.command + (run.tests ? ` · тесты ${run.tests.passed}/${run.tests.total}` : ' · ' + runLabels[run.status]), stale: true });
   return problems;
 }
+let configRequest = 0, configLabel = '';
+$('edit-profile-config').addEventListener('click', () => { openCommandSettings(); $('profile-config').focus(); });
+function refreshConfigLabel(id) {
+  const request = ++configRequest;
+  configLabel = 'Определяем конфигурацию…';
+  api.codeConfig(id).then(value => value ?? 'без конфигурации', errorText).then(label => {
+    if (request !== configRequest || id !== state.activeChat) return;
+    configLabel = label;
+    if (workflowMode === 'problems') renderProblems();
+  });
+}
 function renderProblems() {
   if (!state || !activeChat()) return;
-  const root = currentRoot(); if (analysisRoot !== root) { selectedProblems.clear(); analysisRoot = root; }
-  const analysis = state.analyses?.[root], problems = rootProblems(); $('problems-list').replaceChildren();
+  const root = currentRoot(); if (analysisRoot !== analysisKey()) { selectedProblems.clear(); analysisRoot = analysisKey(); refreshConfigLabel(state.activeChat); }
+  const analysis = state.analyses?.[analysisKey()], problems = rootProblems(); $('problems-list').replaceChildren();
   const valid = new Set(problems.map(problem => JSON.stringify(problem))); for (const key of selectedProblems) if (!valid.has(key)) selectedProblems.delete(key);
   $('analyze-project').disabled = analysisBusy;
   setText('problems-status', analysisBusy ? 'Проверяем JS/TS с учётом открытых буферов…' : !analysis ? 'Анализ ещё не запускался' : `${analysis.stale ? 'Результат устарел · ' : ''}TS ${analysis.version} · ${analysis.files} файлов · ${new Date(analysis.checkedAt).toLocaleTimeString()}${analysis.limited ? ' · анализ ограничен' : ''}`);
+  const profile = state.projectProfiles[activeChat().projectId];
+  $('problems-status').prepend(profile.name + ' · ' + (analysis && !analysis.stale ? analysis.config ?? 'без конфигурации' : configLabel) + ' · ');
   if (analysis?.note) $('problems-list').append(element('p', 'panel-note', analysis.note));
   if (!problems.length) $('problems-list').append(element('p', 'panel-note', analysis && !analysis.stale ? analysis.limited ? 'В проверенной части ошибок не найдено. Анализ ограничен.' : 'Ошибок JS/TS не обнаружено. Результаты тестов и сборки проверяются отдельными командами.' : 'Обновите анализ, чтобы получить актуальный список проблем.'));
   for (const problem of problems) {
@@ -96,7 +120,7 @@ $('analyze-project').addEventListener('click', async () => {
   if (analysisBusy) return; const id = state.activeChat; analysisBusy = true; renderProblems();
   try {
     if (changedCodeTimer) { clearTimeout(changedCodeTimer); changedCodeTimer = null; await api.staleAnalysis(id); }
-    await refreshCleanEditorBuffers(); const data = await api.codeQuery(id, 'diagnostics', { overlays: editorOverlays() }); state.analyses ??= {}; state.analyses[data.root] = data;
+    await refreshCleanEditorBuffers(); const data = await api.codeQuery(id, 'diagnostics', { overlays: editorOverlays() }); state.analyses ??= {}; state.analyses[data.key] = data;
   }
   catch (error) { toast(error); } finally { analysisBusy = false; renderProblems(); }
 });
@@ -105,10 +129,10 @@ $('send-problems').addEventListener('click', () => {
   $('prompt').value = ($('prompt').value ? $('prompt').value + '\n\n' : '') + 'Разбери и исправь выбранные проблемы, затем повтори соответствующие проверки:\n' + problems.map(problem => `${problem.path ?? ''}:${problem.line ?? ''} ${problem.code}: ${problem.message}${problem.stale ? ' (предыдущая проверка — сначала проверь актуальность)' : ''}`).join('\n');
   $('prompt').dispatchEvent(new Event('input', { bubbles: true })); $('prompt').focus();
 });
-api.onAnalysis(data => { if (!state) return; state.analyses ??= {}; state.analyses[data.root] = data; if (workflowMode === 'problems') renderProblems(); });
-api.onAnalysisStale(root => { if (state?.analyses?.[root]) { state.analyses[root].stale = true; if (workflowMode === 'problems') renderProblems(); } });
+api.onAnalysis(data => { if (!state) return; state.analyses ??= {}; state.analyses[data.key] = data; if (workflowMode === 'problems') renderProblems(); });
+api.onAnalysisStale(root => { if (state?.analyses?.[root]) { state.analyses[root].stale = true; if (root === analysisKey()) refreshConfigLabel(state.activeChat); if (workflowMode === 'problems') renderProblems(); } });
 
-function contextStateKey() { const chat = activeChat(); return JSON.stringify([chat?.id, currentRoot(), chat?.pins, chat?.summary?.id, currentContext(), (externalDrafts.get(chat?.id) ?? []).map(file => file.id), editView?.path, $('prompt').value.slice(0, 500)]); }
+function contextStateKey() { const chat = activeChat(); return JSON.stringify([chat?.id, analysisKey(), state.projectProfiles?.[chat?.projectId], chat?.pins, chat?.summary?.id, currentContext(), (externalDrafts.get(chat?.id) ?? []).map(file => file.id), editView?.path, $('prompt').value.slice(0, 500)]); }
 async function refreshContextDetails() {
   const generation = ++contextGeneration, id = state.activeChat;
   try {
@@ -122,7 +146,16 @@ function renderContextList() {
   const data = contextCache, list = $('context-list'); list.replaceChildren();
   setText('context-status', compressionMessage || `${data.chars.toLocaleString()} символов в инструкциях, сводке и выбранных файлах. История агента учитывается в отчёте API.`);
   const block = (title, text) => { const node = element('details', 'context-block'); node.append(element('summary', '', title), element('pre', 'context-text', text || 'Нет')); list.append(node); };
-  block('Инструкции · AGENTS.md', data.instructions.text);
+  list.append(element('strong','',data.profile.name + ' · ' + (data.profile.directory || '.')),
+    element('p','panel-note','Конфигурация JS/TS · ' + (data.config ?? 'без конфигурации')),
+    workflowButton('Настройки профиля', () => openCommandSettings()));
+  block('Команды профиля', Object.entries(data.profile.commands).filter(([,cmd])=>cmd).map(([key,cmd])=>projectCommandLabels[key] + ' · ' + cmd).join('\n'));
+  for (const file of data.instructions.sources) {
+    const node = element('details','context-block');
+    node.append(element('summary','',file.path + (file.exists ? '' : ' · отсутствует')),element('pre','context-text',file.text || 'Нет инструкций'),
+      workflowButton(file.exists ? 'Редактировать' : 'Создать', () => openInstructions(null,file.path)));
+    list.append(node);
+  }
   block('Сводка · ' + (data.summary ? new Date(data.summary.createdAt).toLocaleString() : 'ещё нет'), data.summary?.text);
   for (const [kind, refs] of [['pin', data.pins], ['draft', data.drafts]]) refs.forEach((ref, index) => {
     const row = element('div', 'context-ref' + (ref.stale ? ' stale' : ''));
@@ -191,7 +224,7 @@ function renderIntelligence() {
   const request = (state.apiRequests ?? []).find(item => item.chatId === chat.id);
   setText('show-api', request && !['done', 'error', 'cancelled', 'interrupted'].includes(request.phase) ? 'API · ' + (request.attempt ?? 1) : 'API');
   if (workflowMode === 'problems') renderProblems();
-  if (workflowMode === 'context') { const key = contextStateKey(); if (key !== contextKey) { contextKey = key; void refreshContextDetails(); } else renderContextList(); }
+  if (workflowMode === 'context') { const key = contextStateKey(); if (key !== contextKey) { contextKey = key; contextCache = null; $('context-list').replaceChildren(); setText('context-status','Загрузка контекста…'); void refreshContextDetails(); } else renderContextList(); }
   if (workflowMode === 'api') renderApiRequests();
 }
 for (const [id, mode] of [['show-problems', 'problems'], ['show-context', 'context'], ['show-api', 'api'], ['drawer-problems-tab', 'problems'], ['drawer-context-tab', 'context'], ['drawer-api-tab', 'api']]) $(id).addEventListener('click', () => openWorkflow(mode));

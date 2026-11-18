@@ -14,6 +14,7 @@ function profileControls(chat, original) {
   const picker = element('select'); picker.setAttribute('aria-label','Профиль команд');
   for (const profile of state.profileSets[chat.projectId]) picker.add(new Option(profile.name, profile.id));
   picker.value = chat.profileId;
+  picker.disabled = Boolean(state.busy === chat.id || state.workspaceMutation || chat.archivedAt);
   picker.addEventListener('change', async () => {
     try { updateState(await api.selectCommandProfile(chat.id, picker.value)); } catch (error) { toast(error); }
   });
@@ -155,6 +156,7 @@ function openCommandSettings(create = false) {
   const profile = create === true ? { id: crypto.randomUUID(), commands: {} } : state.projectProfiles[chat.projectId];
   commandSettingsTarget = { chatId: chat.id, id: profile.id };
   $('profile-name').value = profile.name ?? ''; $('profile-name').readOnly = profile.id === 'all';
+  $('profile-config').value = profile.config ?? '';
   $('profile-scope').value = (profile.scope ?? []).join('\n');
   $('profile-sequence').replaceChildren(...[0,1,2].map(i => {
     const select = element('select'); select.setAttribute('aria-label','Шаг ' + (i+1));
@@ -174,6 +176,7 @@ $('project-command-settings').addEventListener('click', openCommandSettings);
 $('commands-form').addEventListener('submit', async event => {
   event.preventDefault(); const value = { directory: $('command-directory').value, runtime: $('command-runtime').value,
     id: commandSettingsTarget.id, name: $('profile-name').value, scope: $('profile-scope').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),
+    config: $('profile-config').value,
     commands: Object.fromEntries(Object.keys(projectCommandLabels).map(key => [key, $('project-command-' + key).value])) };
   const steps = [...$('profile-sequence').children].map(select=>select.value).filter(Boolean);
   if (steps.length) value.sequence = steps;

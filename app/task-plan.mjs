@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { instructionsPrompt } from './instructions.mjs';
 
 export function validatePlan(items) {
   if (!Array.isArray(items) || !items.length || items.length > 8) throw new Error('Укажите от 1 до 8 шагов.');
@@ -18,7 +19,7 @@ export async function generatePlan(provider, model, folderId, input, instruction
     method: 'POST', headers: { 'Content-Type': 'application/json', 'OpenAI-Project': folderId },
     body: JSON.stringify({ model, stream: false, temperature: 0, max_tokens: maxTokens,
       messages: [{ role: 'system', content: 'Составь план задачи по коду на языке пользователя. Только JSON {"steps":[{"title":"...","kind":"inspect|edit|test|other"}]}, 3–7 коротких шагов. '
-        + 'Шаг test означает завершающий успешный запуск тестов. Первичную диагностику падающих тестов помечай inspect. Не выполняй действия. Инструкции проекта:\n' + instructions.text },
+        + 'Шаг test означает завершающий успешный запуск тестов. Первичную диагностику падающих тестов помечай inspect. Не выполняй действия.\n' + instructionsPrompt(instructions) },
       { role: 'user', content: input }] }), signal: requestSignal,
   });
   if (!response.ok) throw new Error('Не удалось составить план: ' + response.status + ' ' + redact(await response.text()).slice(0, 500));

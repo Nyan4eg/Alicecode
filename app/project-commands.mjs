@@ -20,7 +20,9 @@ export function commandProfile(value = {}) {
   if (!Array.isArray(sequence) || sequence.length > 3 || new Set(sequence).size !== sequence.length || sequence.some(key => !['types','test','build'].includes(key) || !commands[key])) throw Error('Для каждого шага проверки нужна настроенная команда.');
   const id = value.id ?? 'all', name = text(value.name ?? 'Весь проект', 60);
   if (!name || !/^(all|[a-zA-Z0-9_-]{1,64})$/.test(id)) throw Error('Некорректный профиль.');
-  return { id, name, commands, directory, scope, sequence, runtime: text(value.runtime ?? '', 1000) };
+  const config = text(value.config ?? '',500).replaceAll('\\','/');
+  if (config && (!config.endsWith('.json') || /[:*?]/.test(config) || config.split('/').some(part => !part || part === '..'))) throw Error('Укажите путь к файлу JSON от корня проекта.');
+  return { id, name, commands, directory, config, scope, sequence, runtime: text(value.runtime ?? '', 1000) };
 }
 export async function commandEnvironment(profile) {
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;

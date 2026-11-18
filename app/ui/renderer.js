@@ -381,6 +381,13 @@ function renderThread(forceScroll) {
 
 function renderComposer() {
   const chat = activeChat();
+  const picker = $('composer-profile'), profiles = state.profileSets?.[chat?.projectId] ?? [];
+  const labels = profiles.map(p => [p.name + ' · ' + (p.directory || '.'),p.id]);
+  const optionsKey = JSON.stringify(labels);
+  if (picker.dataset.options !== optionsKey) {
+    picker.replaceChildren(...labels.map(([label,id]) => new Option(label,id))); picker.dataset.options = optionsKey;
+  }
+  picker.value = chat?.profileId ?? 'all'; picker.disabled = !chat || Boolean(chat.archivedAt || state.busy || state.workspaceMutation);
   $('approval-mode').value = chat?.approval ?? 'ask';
   $('approval-mode').disabled = !chat || Boolean(chat.archivedAt) || state.busy === chat.id;
   $('use-plan').checked = Boolean(chat?.planning);
@@ -2171,24 +2178,26 @@ function renderTask(message, expanded = false) {
       resume.addEventListener('click', () => api.resumeTask(message.chatId, message.id).catch(toast)); panel.append(resume);
     }
   } else if (task.status === 'planning') panel.append(element('p', 'busy-text', 'Алиса составляет план…'));
-  if (task.instructions.text) {
-    const button = element('button', 'quiet task-instructions', 'AGENTS.md · снимок инструкций'); button.type = 'button';
-    button.addEventListener('click', () => openInstructions(task.instructions)); panel.append(button);
+  if (task.profile?.name) panel.append(element('span','task-branch-label',task.profile.name + ' · ' + (task.profile.directory || '.')));
+  for (const file of task.instructions.sources ?? [task.instructions]) {
+    if (!file.exists && !file.text) continue;
+    const button = element('button', 'quiet task-instructions', file.path + ' · снимок инструкций'); button.type = 'button';
+    button.addEventListener('click', () => openInstructions(file)); panel.append(button);
   }
   return panel;
 }
 
-async function openInstructions(snapshot = null) {
+async function openInstructions(snapshot = null, path = 'AGENTS.md') {
   if (document.querySelector('dialog[open]')) return;
   const chatId = state.activeChat;
   try {
-    const file = snapshot ?? await api.instructions(chatId);
+    const file = snapshot ?? await api.instructions(chatId,path);
     instructionsTarget = { chatId, file, snapshot: Boolean(snapshot) };
     $('instructions-text').value = file.text;
     $('instructions-text').readOnly = Boolean(snapshot);
     $('instructions-text').placeholder = '# Инструкции проекта\n\n## Тесты\nnode --test\n\n## Требования\nСохраняй существующие пользовательские изменения.\n';
-    setText('instructions-note', snapshot ? 'Снимок AGENTS.md, использованный в этом запуске: ' + file.stamp
-      : 'AGENTS.md в текущей рабочей папке. Изменения применяются со следующего запуска задачи.');
+    setText('instructions-note', snapshot ? 'Снимок ' + file.path + ', использованный в этом запуске.'
+      : file.path + ' в рабочей папке. Изменения применяются со следующего запуска задачи.');
     $('save-instructions').hidden = Boolean(snapshot);
     $('instructions-error').hidden = true;
     $('instructions-dialog').showModal();
@@ -2200,7 +2209,8 @@ $('instructions-form').addEventListener('submit', async event => {
   const target = instructionsTarget;
   if (!target || target.snapshot) return;
   try {
-    await api.saveInstructions(target.chatId, $('instructions-text').value, target.file.stamp);
+    await api.saveInstructions(target.chatId, $('instructions-text').value, target.file.stamp, target.file.path);
+    contextKey = ''; renderIntelligence();
     $('instructions-dialog').close(); refreshWorkspace();
   } catch (error) { setText('instructions-error', errorText(error)).hidden = false; }
 });

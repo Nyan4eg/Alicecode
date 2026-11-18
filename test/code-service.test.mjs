@@ -4,6 +4,37 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { codeQuery } from '../app/code-service.mjs';
+import { profileInstructions, instructionsPrompt } from '../app/instructions.mjs';
+
+test('package configs use their own strictness, extends and alias roots; scoped rules follow the package', async t => {
+  const root = await mkdtemp(join(tmpdir(),'alicecode-profile-ts-'));
+  t.after(() => rm(root,{ recursive:true,force:true }));
+  for (const dir of ['api','web','shared']) await mkdir(join(root,dir));
+  await writeFile(join(root,'base.json'),JSON.stringify({compilerOptions:{target:'ES2022',module:'NodeNext',types:[]}}));
+  await writeFile(join(root,'shared/types.ts'),'export interface Quote { price?: number }');
+  const source = 'import type { Quote } from "@shared/types";\nexport const total = (q: Quote): number => q.price;';
+  for (const dir of ['api','web']) {
+    await writeFile(join(root,dir,'entry.ts'),source);
+    await writeFile(join(root,dir,'tsconfig.json'),JSON.stringify({extends:'../base.json',compilerOptions:{
+      strict:dir==='api',paths:{'@shared/*':['../shared/*']},rootDir:'..'},include:['entry.ts']}));
+    await writeFile(join(root,dir,'AGENTS.md'),dir+' rule');
+  }
+  await writeFile(join(root,'AGENTS.md'),'root rule');
+  const api = {directory:'api'},web = {directory:'web'};
+  const rules = await profileInstructions(root,api);
+  assert.deepEqual(rules.sources.map(file=>file.path),['AGENTS.md','api/AGENTS.md']);
+  assert.match(instructionsPrompt(rules),/root rule[\s\S]*api rule/);
+  assert.doesNotMatch(instructionsPrompt(rules),/web rule/);
+  const diagnostics = await codeQuery(root,'diagnostics',{},api);
+  assert.equal(diagnostics.config,'api/tsconfig.json');
+  assert.deepEqual(diagnostics.problems.map(p=>[p.path,p.code]),[['api/entry.ts','TS2322']]);
+  assert.deepEqual((await codeQuery(root,'diagnostics',{},web)).problems,[]);
+  const manual = await codeQuery(root,'diagnostics',{}, {...web,config:'api/tsconfig.json'});
+  assert.deepEqual(manual.problems,diagnostics.problems);
+  const def = await codeQuery(root,'definition',{path:'api/entry.ts',position:source.lastIndexOf('Quote')+1},api);
+  assert.equal(def.items[0]?.path,'shared/types.ts');
+  await assert.rejects(codeQuery(root,'diagnostics',{}, {...api,config:'missing.json'}),/missing.json/);
+});
 
 test('JS/TS navigation resolves cross-file symbols and type diagnostics respect unsaved buffers', async () => {
   const root = await mkdtemp(join(tmpdir(), 'alicecode-language-'));
